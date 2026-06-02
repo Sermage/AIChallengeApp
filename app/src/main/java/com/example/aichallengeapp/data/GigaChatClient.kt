@@ -103,11 +103,20 @@ object GigaChatClient {
      * Отправляет [messages] в GigaChat и возвращает ответ модели.
      * Автоматически обновляет токен при необходимости.
      */
-    suspend fun chat(messages: List<MessageObj>): ChatResponseObj {
+    suspend fun chat(
+        messages: List<MessageObj>,
+        maxTokens: Int? = null,
+        stopSequences: List<String>? = null,
+    ): ChatResponseObj {
         val token = getValidToken()
         return chatApi.chat(
             authorization = "Bearer $token",
-            body = ChatRequestObj(model = MODEL, messages = messages),
+            body = ChatRequestObj(
+                model = MODEL,
+                messages = messages,
+                maxTokens = maxTokens,
+                stop = stopSequences,
+            ),
         )
     }
 }
