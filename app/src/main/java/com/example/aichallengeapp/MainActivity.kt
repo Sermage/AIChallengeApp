@@ -14,8 +14,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -41,6 +41,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.aichallengeapp.data.GigaChatClient
 import com.example.aichallengeapp.data.MessageObj
+import com.example.aichallengeapp.ui.FourApproachesScreen
 import com.example.aichallengeapp.ui.theme.AIChallengeAppTheme
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -157,8 +158,19 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             AIChallengeAppTheme {
+                var showFourApproaches by remember { mutableStateOf(false) }
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    ChatScreen(modifier = Modifier.padding(innerPadding))
+                    if (showFourApproaches) {
+                        FourApproachesScreen(
+                            onBack = { showFourApproaches = false },
+                            modifier = Modifier.padding(innerPadding),
+                        )
+                    } else {
+                        ChatScreen(
+                            onNavigateToFourApproaches = { showFourApproaches = true },
+                            modifier = Modifier.padding(innerPadding),
+                        )
+                    }
                 }
             }
         }
@@ -171,6 +183,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun ChatScreen(
+    onNavigateToFourApproaches: () -> Unit = {},
     modifier: Modifier = Modifier,
     chatViewModel: ChatViewModel = viewModel(),
 ) {
@@ -188,10 +201,19 @@ fun ChatScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(
-            text = "GigaChat Mini",
-            style = MaterialTheme.typography.headlineSmall,
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "GigaChat Mini",
+                style = MaterialTheme.typography.headlineSmall,
+            )
+            OutlinedButton(onClick = onNavigateToFourApproaches) {
+                Text("4 подхода")
+            }
+        }
 
         OutlinedTextField(
             value = inputText,
