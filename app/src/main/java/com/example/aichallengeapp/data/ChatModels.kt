@@ -24,6 +24,7 @@ data class MessageObj(
 @Serializable
 data class ChatResponseObj(
     val choices: List<ChoiceObj>,
+    val usage: UsageObj? = null,
 )
 
 /** Один вариант ответа от модели. */
@@ -31,6 +32,14 @@ data class ChatResponseObj(
 data class ChoiceObj(
     val message: MessageObj,
     @SerialName("finish_reason") val finishReason: String? = null,
+)
+
+/** Статистика токенов. */
+@Serializable
+data class UsageObj(
+    @SerialName("prompt_tokens") val promptTokens: Int = 0,
+    @SerialName("completion_tokens") val completionTokens: Int = 0,
+    @SerialName("total_tokens") val totalTokens: Int = 0,
 )
 
 /** Ответ OAuth-сервера Сбера с токеном доступ��. */

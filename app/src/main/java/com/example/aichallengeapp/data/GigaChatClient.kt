@@ -108,10 +108,11 @@ object GigaChatClient {
         maxTokens: Int? = null,
         stopSequences: List<String>? = null,
         temperature: Double? = null,
+        model: String = MODEL,
     ): ChatResponseObj {
         val token = getValidToken()
         Log.d("GigaChat", "=== ЗАПРОС ===")
-        Log.d("GigaChat", "temperature=$temperature, maxTokens=$maxTokens")
+        Log.d("GigaChat", "model=$model, temperature=$temperature, maxTokens=$maxTokens")
         messages.forEachIndexed { i, m ->
             Log.d(
                 "GigaChat",
@@ -122,7 +123,7 @@ object GigaChatClient {
         val response = chatApi.chat(
             authorization = "Bearer $token",
             body = ChatRequestObj(
-                model = MODEL,
+                model = model,
                 messages = messages,
                 maxTokens = maxTokens,
                 stop = stopSequences,

@@ -56,8 +56,29 @@ import kotlinx.coroutines.launch
 sealed interface ChatUiState {
     data object Idle : ChatUiState
     data object Loading : ChatUiState
-    data class Success(val text: String) : ChatUiState
+    data class Success(
+        val text: String,
+        val elapsedMs: Long = 0,
+        val promptTokens: Int = 0,
+        val completionTokens: Int = 0,
+        val totalTokens: Int = 0,
+        val costRub: Double = 0.0,
+    ) : ChatUiState
     data class Error(val message: String) : ChatUiState
+}
+
+/**
+ * Доступные модели GigaChat.
+ * costPer1kTokens — стоимость в рублях за 1000 токенов (вход и выход одинаковы).
+ * Тарифы для физлиц: developers.sber.ru/docs/ru/gigachat/tariffs/individual-tariffs
+ */
+enum class GigaChatModel(val id: String, val title: String, val costPer1kTokens: Double) {
+    Base("GigaChat", "GigaChat (слабая)", 0.065),
+    Pro("GigaChat-Pro", "GigaChat-Pro (средняя)", 0.5),
+    Max("GigaChat-Max", "GigaChat-Max (сильная)", 0.65),
+    Base2("GigaChat-2", "GigaChat-2 (слабая, v2)", 0.065),
+    Pro2("GigaChat-2-Pro", "GigaChat-2-Pro (средняя, v2)", 0.5),
+    Max2("GigaChat-2-Max", "GigaChat-2-Max (сильная, v2)", 0.65),
 }
 
 /** Режим формирования ответа модели. */
@@ -87,12 +108,14 @@ class ChatViewModel : ViewModel() {
         responseMode: ResponseMode,
         restrictions: ResponseRestrictions,
         temperature: Double,
+        model: GigaChatModel,
     ) {
         if (prompt.isBlank()) return
 
         _uiState.value = ChatUiState.Loading
 
         viewModelScope.launch {
+            val startMs = System.currentTimeMillis()
             runCatching {
                 val messages = buildMessages(
                     prompt = prompt,
@@ -108,11 +131,23 @@ class ChatViewModel : ViewModel() {
                     }
                         ?.let(::listOf),
                     temperature = temperature,
+                    model = model.id,
                 )
             }.onSuccess { response ->
+                val elapsed = System.currentTimeMillis() - startMs
                 val answer = response.choices.firstOrNull()?.message?.content.orEmpty()
-                Log.d("GigaChat", "Ответ: $answer")
-                _uiState.value = ChatUiState.Success(answer)
+                val usage = response.usage
+                val totalTokens = usage?.totalTokens ?: 0
+                val costRub = totalTokens / 1000.0 * model.costPer1kTokens
+                Log.d("GigaChat", "Ответ за ${elapsed}мс, токены: $usage, стоимость: $costRub ₽")
+                _uiState.value = ChatUiState.Success(
+                    text = answer,
+                    elapsedMs = elapsed,
+                    promptTokens = usage?.promptTokens ?: 0,
+                    completionTokens = usage?.completionTokens ?: 0,
+                    totalTokens = totalTokens,
+                    costRub = costRub,
+                )
             }.onFailure { error ->
                 Log.e("GigaChat", "Ошибка запроса", error)
                 _uiState.value = ChatUiState.Error(error.message ?: "Неизвестная ошибка")
@@ -197,11 +232,12 @@ fun ChatScreen(
     var maxTokensText by remember { mutableStateOf("200") }
     var stopSequence by remember { mutableStateOf("###") }
     var temperature by remember { mutableStateOf(0.7) }
+    var selectedModel by remember { mutableStateOf(GigaChatModel.Base) }
 
-    // Внешняя колонка: верхний блок фиксирован, нижний скроллируется
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -225,6 +261,11 @@ fun ChatScreen(
             label = { Text("Введите вопрос") },
             modifier = Modifier.fillMaxWidth(),
             minLines = 3,
+        )
+
+        ModelDropdown(
+            selectedModel = selectedModel,
+            onModelSelected = { selectedModel = it },
         )
 
         ResponseModeDropdown(
@@ -274,6 +315,7 @@ fun ChatScreen(
                             stopSequence = stopSequence,
                         ),
                         temperature = temperature,
+                        model = selectedModel,
                     )
                 },
                 enabled = uiState !is ChatUiState.Loading,
@@ -282,21 +324,14 @@ fun ChatScreen(
             }
         }
 
-        // Область ответа — занимает оставшееся место и скроллируется независимо
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-        ) {
+        Box(modifier = Modifier.fillMaxWidth()) {
             when (val state = uiState) {
                 is ChatUiState.Loading -> {
                     CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
                 }
                 is ChatUiState.Success -> {
                     Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .verticalScroll(rememberScrollState()),
+                        modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Text(
@@ -305,6 +340,17 @@ fun ChatScreen(
                         )
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(text = state.text)
+                        if (state.elapsedMs > 0) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "⏱ ${state.elapsedMs} мс  |  " +
+                                        "токены: ${state.promptTokens}→${state.completionTokens} " +
+                                        "(всего ${state.totalTokens})  |  " +
+                                        "~${String.format("%.4f", state.costRub)} ₽",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
                 is ChatUiState.Error -> {
@@ -357,6 +403,38 @@ private fun TemperatureSelector(
             enabled = Math.round(selected * 10) < 20,
         ) {
             Text("+")
+        }
+    }
+}
+
+@Composable
+private fun ModelDropdown(
+    selectedModel: GigaChatModel,
+    onModelSelected: (GigaChatModel) -> Unit,
+) {
+    var isExpanded by remember { mutableStateOf(false) }
+
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = { isExpanded = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Модель: ${selectedModel.title}")
+        }
+
+        DropdownMenu(
+            expanded = isExpanded,
+            onDismissRequest = { isExpanded = false },
+        ) {
+            GigaChatModel.entries.forEach { model ->
+                DropdownMenuItem(
+                    text = { Text(model.title) },
+                    onClick = {
+                        onModelSelected(model)
+                        isExpanded = false
+                    },
+                )
+            }
         }
     }
 }
