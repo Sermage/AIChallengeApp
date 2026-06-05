@@ -107,6 +107,7 @@ object GigaChatClient {
         messages: List<MessageObj>,
         maxTokens: Int? = null,
         stopSequences: List<String>? = null,
+        temperature: Double? = null,
     ): ChatResponseObj {
         val token = getValidToken()
         return chatApi.chat(
@@ -116,6 +117,7 @@ object GigaChatClient {
                 messages = messages,
                 maxTokens = maxTokens,
                 stop = stopSequences,
+                temperature = temperature,
             ),
         )
     }

@@ -10,6 +10,7 @@ data class ChatRequestObj(
     val messages: List<MessageObj>,
     @SerialName("max_tokens") val maxTokens: Int? = null,
     val stop: List<String>? = null,
+    val temperature: Double? = null,
 )
 
 /** Одно сообщение в диалоге (role: "user" / "assistant" / "system"). */

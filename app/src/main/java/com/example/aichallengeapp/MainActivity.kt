@@ -35,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -85,6 +86,7 @@ class ChatViewModel : ViewModel() {
         prompt: String,
         responseMode: ResponseMode,
         restrictions: ResponseRestrictions,
+        temperature: Double,
     ) {
         if (prompt.isBlank()) return
 
@@ -105,6 +107,7 @@ class ChatViewModel : ViewModel() {
                         responseMode == ResponseMode.Restricted && it.isNotBlank()
                     }
                         ?.let(::listOf),
+                    temperature = temperature,
                 )
             }.onSuccess { response ->
                 val answer = response.choices.firstOrNull()?.message?.content.orEmpty()
@@ -193,6 +196,7 @@ fun ChatScreen(
     var responseFormat by remember { mutableStateOf("Краткий список с маркированными пунктами") }
     var maxTokensText by remember { mutableStateOf("200") }
     var stopSequence by remember { mutableStateOf("###") }
+    var temperature by remember { mutableStateOf(0.7) }
 
     // Внешняя колонка: верхний блок фиксирован, нижний скроллируется
     Column(
@@ -226,6 +230,11 @@ fun ChatScreen(
         ResponseModeDropdown(
             selectedMode = responseMode,
             onModeSelected = { responseMode = it },
+        )
+
+        TemperatureSelector(
+            selected = temperature,
+            onSelected = { temperature = it },
         )
 
         if (responseMode == ResponseMode.Restricted) {
@@ -264,6 +273,7 @@ fun ChatScreen(
                             maxTokens = maxTokensText.toIntOrNull(),
                             stopSequence = stopSequence,
                         ),
+                        temperature = temperature,
                     )
                 },
                 enabled = uiState !is ChatUiState.Loading,
@@ -306,6 +316,47 @@ fun ChatScreen(
                 }
                 else -> Unit
             }
+        }
+    }
+}
+
+@Composable
+private fun TemperatureSelector(
+    selected: Double,
+    onSelected: (Double) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "Температура:",
+            style = MaterialTheme.typography.labelMedium,
+        )
+        OutlinedButton(
+            onClick = {
+                val newVal = (Math.round((selected - 0.1) * 10) / 10.0).coerceAtLeast(0.1)
+                onSelected(newVal)
+            },
+            enabled = Math.round(selected * 10) > 1,
+        ) {
+            Text("−")
+        }
+        Text(
+            text = String.format("%.1f", selected),
+            style = MaterialTheme.typography.bodyLarge,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.weight(1f),
+        )
+        OutlinedButton(
+            onClick = {
+                val newVal = (Math.round((selected + 0.1) * 10) / 10.0).coerceAtMost(2.0)
+                onSelected(newVal)
+            },
+            enabled = Math.round(selected * 10) < 20,
+        ) {
+            Text("+")
         }
     }
 }
