@@ -110,7 +110,16 @@ object GigaChatClient {
         temperature: Double? = null,
     ): ChatResponseObj {
         val token = getValidToken()
-        return chatApi.chat(
+        Log.d("GigaChat", "=== ЗАПРОС ===")
+        Log.d("GigaChat", "temperature=$temperature, maxTokens=$maxTokens")
+        messages.forEachIndexed { i, m ->
+            Log.d(
+                "GigaChat",
+                "msg[$i] role=${m.role}: ${m.content.take(200)}"
+            )
+        }
+
+        val response = chatApi.chat(
             authorization = "Bearer $token",
             body = ChatRequestObj(
                 model = MODEL,
@@ -120,5 +129,12 @@ object GigaChatClient {
                 temperature = temperature,
             ),
         )
+
+        val responseText = response.choices.firstOrNull()?.message?.content.orEmpty()
+        Log.d("GigaChat", "=== ОТВЕТ ===")
+        responseText.chunked(800).forEach { Log.d("GigaChat", it) }
+        Log.d("GigaChat", "=== КОНЕЦ ===")
+
+        return response
     }
 }
