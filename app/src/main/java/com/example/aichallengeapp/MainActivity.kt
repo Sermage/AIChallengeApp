@@ -42,6 +42,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.aichallengeapp.data.GigaChatClient
 import com.example.aichallengeapp.data.MessageObj
+import com.example.aichallengeapp.ui.AgentScreen
 import com.example.aichallengeapp.ui.FourApproachesScreen
 import com.example.aichallengeapp.ui.theme.AIChallengeAppTheme
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -196,16 +197,22 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             AIChallengeAppTheme {
-                var showFourApproaches by remember { mutableStateOf(false) }
+                var currentScreen by remember { mutableStateOf("chat") }
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    if (showFourApproaches) {
-                        FourApproachesScreen(
-                            onBack = { showFourApproaches = false },
+                    when (currentScreen) {
+                        "fourApproaches" -> FourApproachesScreen(
+                            onBack = { currentScreen = "chat" },
                             modifier = Modifier.padding(innerPadding),
                         )
-                    } else {
-                        ChatScreen(
-                            onNavigateToFourApproaches = { showFourApproaches = true },
+
+                        "agent" -> AgentScreen(
+                            onBack = { currentScreen = "chat" },
+                            modifier = Modifier.padding(innerPadding),
+                        )
+
+                        else -> ChatScreen(
+                            onNavigateToFourApproaches = { currentScreen = "fourApproaches" },
+                            onNavigateToAgent = { currentScreen = "agent" },
                             modifier = Modifier.padding(innerPadding),
                         )
                     }
@@ -222,6 +229,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ChatScreen(
     onNavigateToFourApproaches: () -> Unit = {},
+    onNavigateToAgent: () -> Unit = {},
     modifier: Modifier = Modifier,
     chatViewModel: ChatViewModel = viewModel(),
 ) {
@@ -250,8 +258,13 @@ fun ChatScreen(
                 text = "GigaChat Mini",
                 style = MaterialTheme.typography.headlineSmall,
             )
-            OutlinedButton(onClick = onNavigateToFourApproaches) {
-                Text("4 подхода")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onNavigateToFourApproaches) {
+                    Text("4 подхода")
+                }
+                OutlinedButton(onClick = onNavigateToAgent) {
+                    Text("Агент")
+                }
             }
         }
 
