@@ -1,4 +1,4 @@
-package com.example.aichallengeapp.ui
+package com.example.aichallengeapp.ui.agent
 
 import android.content.Context
 import com.example.aichallengeapp.data.AgentStep
