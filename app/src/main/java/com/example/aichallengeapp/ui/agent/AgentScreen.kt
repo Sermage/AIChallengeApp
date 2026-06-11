@@ -1,11 +1,16 @@
 package com.example.aichallengeapp.ui.agent
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -17,7 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -27,9 +32,12 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.InputChip
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -41,12 +49,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.aichallengeapp.data.AgentStep
 import com.example.aichallengeapp.data.StepType
+
+private const val CONTEXT_WINDOW_LIMIT = 32768
 
 @Composable
 fun AgentScreen(
@@ -58,9 +69,23 @@ fun AgentScreen(
     val isLoading by viewModel.isLoading.collectAsState()
     val selectedIndex by viewModel.selectedAgentIndex.collectAsState()
     val savedSessions by viewModel.savedSessions.collectAsState()
+    val maxTokens by viewModel.maxTokens.collectAsState()
+    val pendingAttachments by viewModel.pendingAttachments.collectAsState()
+    val isUploading by viewModel.isUploading.collectAsState()
     var inputText by remember { mutableStateOf("") }
     var showHistory by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
+
+    val imagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri -> uri?.let { viewModel.addAttachment(it) } }
+
+    val pdfPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri -> uri?.let { viewModel.addAttachment(it) } }
+
+    // Накопленные токены из последнего ответа агента
+    val totalDialogTokens = messages.lastOrNull { !it.isUser }?.historyTokens ?: 0
 
     LaunchedEffect(messages.size, isLoading) {
         val targetIndex = messages.size + if (isLoading) 1 else 0
@@ -96,6 +121,20 @@ fun AgentScreen(
 
         HorizontalDivider()
 
+        // Прогресс-бар контекстного окна
+        if (totalDialogTokens > 0) {
+            ContextWindowBar(totalTokens = totalDialogTokens)
+            HorizontalDivider()
+        }
+
+        // Выбор max_tokens
+        MaxTokensSelector(
+            maxTokens = maxTokens,
+            onMaxTokensChanged = { viewModel.setMaxTokens(it) },
+        )
+
+        HorizontalDivider()
+
         LazyColumn(
             state = listState,
             modifier = Modifier
@@ -105,7 +144,7 @@ fun AgentScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             item { Spacer(Modifier.height(4.dp)) }
-            items(messages, key = { it.id }) { message ->
+            itemsIndexed(messages, key = { _, it -> it.id }) { _, message ->
                 MessageBubble(message = message)
             }
             if (isLoading) {
@@ -118,13 +157,54 @@ fun AgentScreen(
 
         HorizontalDivider()
 
+        // Чипы ожидающих вложений
+        if (pendingAttachments.isNotEmpty() || isUploading) {
+            AttachmentChips(
+                attachments = pendingAttachments,
+                isUploading = isUploading,
+                onRemove = { viewModel.removeAttachment(it) },
+            )
+        }
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(8.dp),
+                .padding(start = 8.dp, end = 8.dp, bottom = 8.dp, top = 4.dp),
             verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            // Кнопка-скрепка с выпадающим меню
+            var showAttachMenu by remember { mutableStateOf(false) }
+            Box {
+                OutlinedButton(
+                    onClick = { showAttachMenu = true },
+                    enabled = !isLoading && !isUploading,
+                    modifier = Modifier.size(48.dp),
+                    contentPadding = PaddingValues(0.dp),
+                ) {
+                    Text("📎", style = MaterialTheme.typography.titleMedium)
+                }
+                DropdownMenu(
+                    expanded = showAttachMenu,
+                    onDismissRequest = { showAttachMenu = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Фото / изображение") },
+                        onClick = {
+                            imagePicker.launch("image/*")
+                            showAttachMenu = false
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("PDF-документ") },
+                        onClick = {
+                            pdfPicker.launch("application/pdf")
+                            showAttachMenu = false
+                        },
+                    )
+                }
+            }
+
             OutlinedTextField(
                 value = inputText,
                 onValueChange = { inputText = it },
@@ -146,6 +226,8 @@ fun AgentScreen(
         }
     }
 }
+
+// ── Заголовок ─────────────────────────────────────────────────────────────────
 
 @Composable
 private fun AgentHeader(
@@ -205,6 +287,103 @@ private fun AgentHeader(
     }
 }
 
+// ── Прогресс-бар контекстного окна ────────────────────────────────────────────
+
+@Composable
+private fun ContextWindowBar(
+    totalTokens: Int,
+    contextLimit: Int = CONTEXT_WINDOW_LIMIT,
+) {
+    val fraction = (totalTokens.toFloat() / contextLimit).coerceIn(0f, 1f)
+    val percent = (fraction * 100).toInt()
+    val barColor = when {
+        fraction > 0.8f -> MaterialTheme.colorScheme.error
+        fraction > 0.5f -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.primary
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = "Контекст диалога: $totalTokens / $contextLimit tok",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "$percent%",
+                style = MaterialTheme.typography.labelSmall,
+                color = barColor,
+            )
+        }
+        Spacer(Modifier.height(3.dp))
+        LinearProgressIndicator(
+            progress = { fraction },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(4.dp)
+                .clip(RoundedCornerShape(2.dp)),
+            color = barColor,
+        )
+    }
+}
+
+// ── Выбор max_tokens ───────────────────────────────────────────────────────────
+
+@Composable
+private fun MaxTokensSelector(
+    maxTokens: Int?,
+    onMaxTokensChanged: (Int?) -> Unit,
+) {
+    val options: List<Pair<Int?, String>> = listOf(
+        50 to "50",
+        150 to "150",
+        500 to "500",
+        null to "∞",
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "max_tokens:",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(end = 2.dp),
+        )
+        options.forEach { (value, label) ->
+            val selected = maxTokens == value
+            if (selected) {
+                Button(
+                    onClick = { onMaxTokensChanged(value) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                ) {
+                    Text(label, style = MaterialTheme.typography.labelMedium)
+                }
+            } else {
+                OutlinedButton(
+                    onClick = { onMaxTokensChanged(value) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                ) {
+                    Text(label, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+    }
+}
+
+// ── Диалог истории ─────────────────────────────────────────────────────────────
+
 @Composable
 private fun HistoryDialog(
     sessions: List<ChatSession>,
@@ -245,7 +424,7 @@ private fun HistoryDialog(
                     }
                 } else {
                     LazyColumn(modifier = Modifier.weight(1f)) {
-                        items(sessions, key = { it.id }) { session ->
+                        itemsIndexed(sessions, key = { _, it -> it.id }) { _, session ->
                             SessionItem(
                                 session = session,
                                 onClick = { onLoadSession(session) },
@@ -311,12 +490,73 @@ private fun SessionItem(
     }
 }
 
+// ── Чипы ожидающих вложений (над полем ввода) ─────────────────────────────────
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AttachmentChips(
+    attachments: List<PendingAttachment>,
+    isUploading: Boolean,
+    onRemove: (String) -> Unit,
+) {
+    FlowRow(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        attachments.forEach { att ->
+            InputChip(
+                selected = false,
+                onClick = { onRemove(att.fileId) },
+                label = {
+                    Text(
+                        text = att.displayName,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+                trailingIcon = { Text("✕", style = MaterialTheme.typography.labelSmall) },
+            )
+        }
+        if (isUploading) {
+            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+        }
+    }
+}
+
+// ── Пузырь сообщения ───────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun MessageBubble(message: ChatMessage) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = if (message.isUser) Alignment.End else Alignment.Start,
     ) {
+        // Чипы вложений (только для сообщений с файлами)
+        if (message.attachmentNames.isNotEmpty()) {
+            FlowRow(
+                modifier = Modifier.padding(bottom = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                message.attachmentNames.forEach { name ->
+                    SuggestionChip(
+                        onClick = {},
+                        label = {
+                            Text(
+                                text = name,
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        },
+                    )
+                }
+            }
+        }
+
         Box(
             modifier = Modifier
                 .widthIn(max = 300.dp)
@@ -345,16 +585,40 @@ private fun MessageBubble(message: ChatMessage) {
             ThinkingCard(step = thinkStep)
         }
 
-        if (!message.isUser && message.totalTokens > 0) {
-            Text(
-                text = "${message.totalTokens} токенов  |  ${message.elapsedMs} мс",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 2.dp, start = 4.dp),
+        // Ответ без контекста для сравнения
+        if (!message.isUser && message.noContextAnswer != null) {
+            NoContextCard(
+                answer = message.noContextAnswer,
+                tokens = message.noContextTokens,
             )
+        }
+
+        if (!message.isUser && message.totalTokens > 0) {
+            Column(
+                modifier = Modifier.padding(top = 2.dp, start = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(1.dp),
+            ) {
+                Text(
+                    text = "Запрос: ${message.requestTokens} tok  |  Ответ: ${message.completionTokens} tok",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "История диалога: ${message.historyTokens} tok  |  Итого: ${message.totalTokens} tok",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "${message.elapsedMs} мс",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
+
+// ── Карточки внутри пузыря ─────────────────────────────────────────────────────
 
 @Composable
 private fun ThinkingCard(step: AgentStep) {
@@ -388,6 +652,47 @@ private fun ThinkingCard(step: AgentStep) {
         }
     }
 }
+
+@Composable
+private fun NoContextCard(answer: String, tokens: Int) {
+    var expanded by remember { mutableStateOf(false) }
+    Card(
+        modifier = Modifier
+            .widthIn(max = 300.dp)
+            .padding(top = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+            TextButton(
+                onClick = { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = if (expanded) "Без контекста ▲" else "Без контекста ▼",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(modifier = Modifier.padding(bottom = 6.dp)) {
+                    Text(
+                        text = answer,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "$tokens tok",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ── Индикатор загрузки ─────────────────────────────────────────────────────────
 
 @Composable
 private fun ThinkingIndicator(agentName: String) {

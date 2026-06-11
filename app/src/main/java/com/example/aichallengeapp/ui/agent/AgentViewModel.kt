@@ -1,13 +1,18 @@
 package com.example.aichallengeapp.ui.agent
 
 import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.aichallengeapp.data.AgentConfig
 import com.example.aichallengeapp.data.AgentStep
+import com.example.aichallengeapp.data.GigaChatClient
 import com.example.aichallengeapp.data.LlmAgent
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -30,6 +35,12 @@ private val PRESET_AGENTS = listOf(
     ),
 )
 
+/** Файл, готовый к отправке: уже загружен в Files API, сохранён ID. */
+data class PendingAttachment(
+    val fileId: String,
+    val displayName: String,
+)
+
 data class ChatMessage(
     val id: Long = System.currentTimeMillis(),
     val isUser: Boolean,
@@ -37,6 +48,18 @@ data class ChatMessage(
     val steps: List<AgentStep> = emptyList(),
     val totalTokens: Int = 0,
     val elapsedMs: Long = 0,
+    /** Токены промпта текущего запроса (prompt_tokens). */
+    val requestTokens: Int = 0,
+    /** Токены ответа модели (completion_tokens). */
+    val completionTokens: Int = 0,
+    /** Накопленные токены всей истории диалога включая это сообщение. */
+    val historyTokens: Int = 0,
+    /** Ответ агента на тот же запрос, но без истории диалога. */
+    val noContextAnswer: String? = null,
+    /** Токены ответа без контекста. */
+    val noContextTokens: Int = 0,
+    /** Имена файлов, приложенных к сообщению (только для отображения). */
+    val attachmentNames: List<String> = emptyList(),
 )
 
 @HiltViewModel
@@ -55,7 +78,22 @@ class AgentViewModel @Inject constructor(
     private val _selectedAgentIndex = MutableStateFlow(0)
     val selectedAgentIndex: StateFlow<Int> = _selectedAgentIndex
 
+    /** Ограничение max_tokens: null — без лимита. */
+    private val _maxTokens = MutableStateFlow<Int?>(null)
+    val maxTokens: StateFlow<Int?> = _maxTokens
+
+    /** Файлы, ожидающие отправки вместе со следующим сообщением. */
+    private val _pendingAttachments = MutableStateFlow<List<PendingAttachment>>(emptyList())
+    val pendingAttachments: StateFlow<List<PendingAttachment>> = _pendingAttachments
+
+    /** Идёт загрузка файла в Files API. */
+    private val _isUploading = MutableStateFlow(false)
+    val isUploading: StateFlow<Boolean> = _isUploading
+
     val agentNames: List<String> get() = PRESET_AGENTS.map { it.name }
+
+    /** Размер активного контекстного окна агента (кол-во сообщений истории). */
+    val contextHistorySize: Int get() = agents[_selectedAgentIndex.value].contextHistorySize
 
     private val _savedSessions = MutableStateFlow<List<ChatSession>>(emptyList())
     val savedSessions: StateFlow<List<ChatSession>> = _savedSessions
@@ -75,22 +113,74 @@ class AgentViewModel @Inject constructor(
         currentSessionId = System.currentTimeMillis()
     }
 
+    fun setMaxTokens(value: Int?) {
+        _maxTokens.value = value
+    }
+
+    /** Загружает файл по URI в Files API и добавляет в список ожидающих вложений. */
+    fun addAttachment(uri: Uri) {
+        viewModelScope.launch {
+            _isUploading.value = true
+            runCatching {
+                val cr = context.contentResolver
+                val bytes = cr.openInputStream(uri)?.use { it.readBytes() }
+                    ?: error("Не удалось прочитать файл")
+                val mimeType = cr.getType(uri) ?: "application/octet-stream"
+                val displayName = resolveDisplayName(uri)
+                val fileId = GigaChatClient.uploadFile(bytes, displayName, mimeType)
+                _pendingAttachments.value = _pendingAttachments.value +
+                        PendingAttachment(fileId, displayName)
+            }
+            _isUploading.value = false
+        }
+    }
+
+    fun removeAttachment(fileId: String) {
+        _pendingAttachments.value = _pendingAttachments.value.filter { it.fileId != fileId }
+    }
+
     fun send(query: String) {
         if (query.isBlank() || _isLoading.value) return
         val agent = agents[_selectedAgentIndex.value]
+        val maxTok = _maxTokens.value
+        val attachments = _pendingAttachments.value
+        _pendingAttachments.value = emptyList()
 
-        _messages.value = _messages.value + ChatMessage(isUser = true, text = query)
+        val fileIds = attachments.map { it.fileId }
+        val attachmentNames = attachments.map { it.displayName }
+
+        _messages.value = _messages.value + ChatMessage(
+            isUser = true,
+            text = query,
+            attachmentNames = attachmentNames,
+        )
         _isLoading.value = true
 
         viewModelScope.launch {
-            runCatching { agent.run(query) }
-                .onSuccess { result ->
+            runCatching {
+                coroutineScope {
+                    // Параллельно: основной запрос с историей и запрос без истории
+                    val noHistoryDeferred = async {
+                        runCatching { agent.runNoHistory(query, maxTok, fileIds) }.getOrNull()
+                    }
+                    val mainResult = agent.run(query, maxTok, fileIds)
+                    Pair(mainResult, noHistoryDeferred.await())
+                }
+            }
+                .onSuccess { (result, noHistoryResult) ->
+                    val historyTokens = _messages.value.filterNot { it.isUser }
+                        .sumOf { it.totalTokens } + result.totalTokens
                     _messages.value = _messages.value + ChatMessage(
                         isUser = false,
                         text = result.answer,
                         steps = result.steps,
                         totalTokens = result.totalTokens,
                         elapsedMs = result.elapsedMs,
+                        requestTokens = result.requestTokens,
+                        completionTokens = result.completionTokens,
+                        historyTokens = historyTokens,
+                        noContextAnswer = noHistoryResult?.answer,
+                        noContextTokens = noHistoryResult?.totalTokens ?: 0,
                     )
                     saveCurrentSession()
                 }
@@ -106,6 +196,7 @@ class AgentViewModel @Inject constructor(
 
     fun clearHistory() {
         _messages.value = emptyList()
+        _pendingAttachments.value = emptyList()
         agents[_selectedAgentIndex.value].reset()
         currentSessionId = System.currentTimeMillis()
     }
@@ -121,6 +212,14 @@ class AgentViewModel @Inject constructor(
         }
         _messages.value = session.messages
         currentSessionId = session.id
+    }
+
+    private fun resolveDisplayName(uri: Uri): String {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val col = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (cursor.moveToFirst() && col >= 0) return cursor.getString(col)
+        }
+        return uri.lastPathSegment ?: "file"
     }
 
     private fun saveCurrentSession() {

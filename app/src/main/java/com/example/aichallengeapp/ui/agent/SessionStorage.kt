@@ -66,6 +66,14 @@ object SessionStorage {
         put("text", m.text)
         put("totalTokens", m.totalTokens)
         put("elapsedMs", m.elapsedMs)
+        put("requestTokens", m.requestTokens)
+        put("completionTokens", m.completionTokens)
+        put("historyTokens", m.historyTokens)
+        m.noContextAnswer?.let { put("noContextAnswer", it) }
+        put("noContextTokens", m.noContextTokens)
+        if (m.attachmentNames.isNotEmpty()) {
+            put("attachmentNames", JSONArray().also { arr -> m.attachmentNames.forEach(arr::put) })
+        }
         put("steps", JSONArray().also { arr ->
             m.steps.forEach { step ->
                 arr.put(JSONObject().apply {
@@ -102,6 +110,14 @@ object SessionStorage {
             text = obj.getString("text"),
             totalTokens = obj.optInt("totalTokens", 0),
             elapsedMs = obj.optLong("elapsedMs", 0),
+            requestTokens = obj.optInt("requestTokens", 0),
+            completionTokens = obj.optInt("completionTokens", 0),
+            historyTokens = obj.optInt("historyTokens", 0),
+            noContextAnswer = obj.optString("noContextAnswer").takeIf { it.isNotEmpty() },
+            noContextTokens = obj.optInt("noContextTokens", 0),
+            attachmentNames = obj.optJSONArray("attachmentNames")?.let { arr ->
+                (0 until arr.length()).map { arr.getString(it) }
+            } ?: emptyList(),
             steps = (0 until stepsArr.length()).map {
                 val s = stepsArr.getJSONObject(it)
                 AgentStep(

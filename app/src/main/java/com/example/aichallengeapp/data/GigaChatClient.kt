@@ -5,7 +5,10 @@ import com.example.aichallengeapp.BuildConfig
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import java.security.SecureRandom
@@ -137,5 +140,22 @@ object GigaChatClient {
         Log.d("GigaChat", "=== КОНЕЦ ===")
 
         return response
+    }
+
+    /**
+     * Загружает файл (изображение или PDF) в GigaChat Files API
+     * и возвращает ID файла для последующей передачи в чат.
+     */
+    suspend fun uploadFile(bytes: ByteArray, filename: String, mimeType: String): String {
+        val token = getValidToken()
+        val fileBody = bytes.toRequestBody(
+            mimeType.toMediaTypeOrNull() ?: "application/octet-stream".toMediaType()
+        )
+        val filePart = MultipartBody.Part.createFormData("file", filename, fileBody)
+        val purposePart = "general".toRequestBody("text/plain".toMediaType())
+        Log.d("GigaChat", "Загружаем файл: $filename ($mimeType, ${bytes.size} байт)")
+        val response = chatApi.uploadFile("Bearer $token", filePart, purposePart)
+        Log.d("GigaChat", "Файл загружен: id=${response.id}")
+        return response.id
     }
 }

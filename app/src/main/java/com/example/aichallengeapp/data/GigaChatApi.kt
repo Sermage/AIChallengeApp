@@ -1,10 +1,14 @@
 package com.example.aichallengeapp.data
 
+import okhttp3.MultipartBody
+import okhttp3.RequestBody
 import retrofit2.http.Body
 import retrofit2.http.Field
 import retrofit2.http.FormUrlEncoded
 import retrofit2.http.Header
+import retrofit2.http.Multipart
 import retrofit2.http.POST
+import retrofit2.http.Part
 
 /**
  * Retrofit-интерфейс для получения OAuth-токена GigaChat.
@@ -38,4 +42,12 @@ interface GigaChatApi {
         @Header("Authorization") authorization: String,
         @Body body: ChatRequestObj,
     ): ChatResponseObj
+
+    @Multipart
+    @POST("files")
+    suspend fun uploadFile(
+        @Header("Authorization") authorization: String,
+        @Part file: MultipartBody.Part,
+        @Part("purpose") purpose: RequestBody,
+    ): FileUploadResponseObj
 }

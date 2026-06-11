@@ -27,6 +27,10 @@ data class AgentResult(
     val answer: String,
     val totalTokens: Int,
     val elapsedMs: Long,
+    /** Сумма prompt_tokens по обоим шагам (THINK + ANSWER). */
+    val requestTokens: Int,
+    /** Сумма completion_tokens по обоим шагам (THINK + ANSWER). */
+    val completionTokens: Int,
 )
 
 /**
@@ -34,54 +38,33 @@ data class AgentResult(
  *   Шаг 1 (THINK) — строит внутреннее рассуждение.
  *   Шаг 2 (ANSWER) — формулирует финальный ответ на основе рассуждения.
  *
- * Вся логика обращения к API инкапсулирована внутри агента.
  * История диалога сохраняется между вызовами [run] для поддержки контекста.
  */
 class LlmAgent(val config: AgentConfig) {
 
+    /** Количество последних сообщений истории, передаваемых в контекст (2 пары user/assistant). */
+    val contextHistorySize: Int = 4
+
     private val history = mutableListOf<MessageObj>()
 
-    /**
-     * Запускает агента с [userQuery] и возвращает [AgentResult] со всеми шагами.
-     */
-    suspend fun run(userQuery: String): AgentResult {
-        val startMs = System.currentTimeMillis()
-        val steps = mutableListOf<AgentStep>()
-        var totalTokens = 0
-
-        // — Шаг 1: Думаем —
-        val thinkResponse = GigaChatClient.chat(
-            messages = buildThinkMessages(userQuery),
-            temperature = config.temperature,
-            model = config.model,
-        )
-        val thinking = thinkResponse.choices.firstOrNull()?.message?.content.orEmpty()
-        val thinkTokens = thinkResponse.usage?.totalTokens ?: 0
-        totalTokens += thinkTokens
-        steps += AgentStep(StepType.THINK, thinking, thinkTokens)
-
-        // — Шаг 2: Отвечаем —
-        val answerResponse = GigaChatClient.chat(
-            messages = buildAnswerMessages(userQuery, thinking),
-            temperature = config.temperature,
-            model = config.model,
-        )
-        val answer = answerResponse.choices.firstOrNull()?.message?.content.orEmpty()
-        val answerTokens = answerResponse.usage?.totalTokens ?: 0
-        totalTokens += answerTokens
-        steps += AgentStep(StepType.ANSWER, answer, answerTokens)
-
-        // Сохраняем последний обмен в историю для контекста следующего запроса
+    /** Запускает агента с историей диалога и сохраняет обмен в историю. */
+    suspend fun run(
+        userQuery: String,
+        maxTokens: Int? = null,
+        attachments: List<String> = emptyList(),
+    ): AgentResult {
+        val result = runInternal(userQuery, maxTokens, historyOverride = null, attachments)
         history += MessageObj("user", userQuery)
-        history += MessageObj("assistant", answer)
-
-        return AgentResult(
-            steps = steps,
-            answer = answer,
-            totalTokens = totalTokens,
-            elapsedMs = System.currentTimeMillis() - startMs,
-        )
+        history += MessageObj("assistant", result.answer)
+        return result
     }
+
+    /** Запускает агента без истории диалога — только текущий запрос. */
+    suspend fun runNoHistory(
+        userQuery: String,
+        maxTokens: Int? = null,
+        attachments: List<String> = emptyList(),
+    ): AgentResult = runInternal(userQuery, maxTokens, historyOverride = emptyList(), attachments)
 
     /** Очищает историю диалога. */
     fun reset() {
@@ -97,16 +80,74 @@ class LlmAgent(val config: AgentConfig) {
         }
     }
 
-    private fun buildThinkMessages(query: String): List<MessageObj> {
+    private suspend fun runInternal(
+        userQuery: String,
+        maxTokens: Int?,
+        historyOverride: List<MessageObj>?,
+        attachments: List<String> = emptyList(),
+    ): AgentResult {
+        val startMs = System.currentTimeMillis()
+        val steps = mutableListOf<AgentStep>()
+        var totalTokens = 0
+
+        // — Шаг 1: Думаем —
+        val thinkResponse = GigaChatClient.chat(
+            messages = buildThinkMessages(userQuery, historyOverride, attachments),
+            temperature = config.temperature,
+            model = config.model,
+            maxTokens = maxTokens,
+        )
+        val thinking = thinkResponse.choices.firstOrNull()?.message?.content.orEmpty()
+        val thinkTokens = thinkResponse.usage?.totalTokens ?: 0
+        totalTokens += thinkTokens
+        steps += AgentStep(StepType.THINK, thinking, thinkTokens)
+
+        // — Шаг 2: Отвечаем —
+        val answerResponse = GigaChatClient.chat(
+            messages = buildAnswerMessages(userQuery, thinking),
+            temperature = config.temperature,
+            model = config.model,
+            maxTokens = maxTokens,
+        )
+        val answer = answerResponse.choices.firstOrNull()?.message?.content.orEmpty()
+        val answerTokens = answerResponse.usage?.totalTokens ?: 0
+        totalTokens += answerTokens
+        steps += AgentStep(StepType.ANSWER, answer, answerTokens)
+
+        // Суммируем по обоим шагам — requestTokens + completionTokens == totalTokens
+        val requestTokens = (thinkResponse.usage?.promptTokens ?: 0) +
+                (answerResponse.usage?.promptTokens ?: 0)
+        val completionTokens = (thinkResponse.usage?.completionTokens ?: 0) +
+                (answerResponse.usage?.completionTokens ?: 0)
+
+        return AgentResult(
+            steps = steps,
+            answer = answer,
+            totalTokens = totalTokens,
+            elapsedMs = System.currentTimeMillis() - startMs,
+            requestTokens = requestTokens,
+            completionTokens = completionTokens,
+        )
+    }
+
+    private fun buildThinkMessages(
+        query: String,
+        historyOverride: List<MessageObj>?,
+        attachments: List<String>,
+    ): List<MessageObj> {
         val system = MessageObj(
             role = "system",
             content = """${config.systemPrompt}
 
 Перед тем как дать ответ, подробно изложи свои рассуждения: что ты знаешь о проблеме, какие есть варианты, что важно учесть. Пиши только процесс мышления — без финального ответа.""".trimIndent(),
         )
-        // последние 2 обмена для поддержки контекста
-        val recentHistory = history.takeLast(4)
-        return listOf(system) + recentHistory + listOf(MessageObj("user", query))
+        val recentHistory = (historyOverride ?: history).takeLast(contextHistorySize)
+        val userMsg = MessageObj(
+            role = "user",
+            content = query,
+            attachments = attachments.takeIf { it.isNotEmpty() },
+        )
+        return listOf(system) + recentHistory + listOf(userMsg)
     }
 
     private fun buildAnswerMessages(query: String, thinking: String): List<MessageObj> {
