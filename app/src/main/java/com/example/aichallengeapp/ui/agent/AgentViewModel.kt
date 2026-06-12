@@ -60,6 +60,10 @@ data class ChatMessage(
     val noContextTokens: Int = 0,
     /** Имена файлов, приложенных к сообщению (только для отображения). */
     val attachmentNames: List<String> = emptyList(),
+    /** true, если ответ был обрублен по лимиту max_tokens. */
+    val finishedByLength: Boolean = false,
+    /** true, если запрос был заблокирован из-за превышения демо-лимита контекста. */
+    val isContextOverflow: Boolean = false,
 )
 
 @HiltViewModel
@@ -82,6 +86,14 @@ class AgentViewModel @Inject constructor(
     private val _maxTokens = MutableStateFlow<Int?>(null)
     val maxTokens: StateFlow<Int?> = _maxTokens
 
+    /** Размер скользящего окна истории (кол-во сообщений, передаваемых агенту). */
+    private val _contextHistorySize = MutableStateFlow(4)
+    val contextHistorySize: StateFlow<Int> = _contextHistorySize
+
+    /** Максимальный суммарный расход токенов за сессию (демо-лимит контекста). */
+    private val _maxContextTokens = MutableStateFlow(32768)
+    val maxContextTokens: StateFlow<Int> = _maxContextTokens
+
     /** Файлы, ожидающие отправки вместе со следующим сообщением. */
     private val _pendingAttachments = MutableStateFlow<List<PendingAttachment>>(emptyList())
     val pendingAttachments: StateFlow<List<PendingAttachment>> = _pendingAttachments
@@ -91,9 +103,6 @@ class AgentViewModel @Inject constructor(
     val isUploading: StateFlow<Boolean> = _isUploading
 
     val agentNames: List<String> get() = PRESET_AGENTS.map { it.name }
-
-    /** Размер активного контекстного окна агента (кол-во сообщений истории). */
-    val contextHistorySize: Int get() = agents[_selectedAgentIndex.value].contextHistorySize
 
     private val _savedSessions = MutableStateFlow<List<ChatSession>>(emptyList())
     val savedSessions: StateFlow<List<ChatSession>> = _savedSessions
@@ -115,6 +124,15 @@ class AgentViewModel @Inject constructor(
 
     fun setMaxTokens(value: Int?) {
         _maxTokens.value = value
+    }
+
+    fun setContextHistorySize(value: Int) {
+        _contextHistorySize.value = value
+        agents.forEach { it.contextHistorySize = value }
+    }
+
+    fun setMaxContextTokens(value: Int) {
+        _maxContextTokens.value = value
     }
 
     /** Загружает файл по URI в Files API и добавляет в список ожидающих вложений. */
@@ -145,6 +163,18 @@ class AgentViewModel @Inject constructor(
         val maxTok = _maxTokens.value
         val attachments = _pendingAttachments.value
         _pendingAttachments.value = emptyList()
+
+        val spentTokens = _messages.value.filterNot { it.isUser }.sumOf { it.totalTokens }
+        val limit = _maxContextTokens.value
+        if (spentTokens > 0 && spentTokens >= limit) {
+            _messages.value = _messages.value + ChatMessage(
+                isUser = false,
+                text = "Контекст переполнен: потрачено $spentTokens / $limit токенов.\n" +
+                        "Очистите историю чтобы продолжить.",
+                isContextOverflow = true,
+            )
+            return
+        }
 
         val fileIds = attachments.map { it.fileId }
         val attachmentNames = attachments.map { it.displayName }
@@ -181,6 +211,7 @@ class AgentViewModel @Inject constructor(
                         historyTokens = historyTokens,
                         noContextAnswer = noHistoryResult?.answer,
                         noContextTokens = noHistoryResult?.totalTokens ?: 0,
+                        finishedByLength = result.finishedByLength,
                     )
                     saveCurrentSession()
                 }

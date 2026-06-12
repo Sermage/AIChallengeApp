@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -49,6 +50,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -57,7 +59,6 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.aichallengeapp.data.AgentStep
 import com.example.aichallengeapp.data.StepType
 
-private const val CONTEXT_WINDOW_LIMIT = 32768
 
 @Composable
 fun AgentScreen(
@@ -70,6 +71,8 @@ fun AgentScreen(
     val selectedIndex by viewModel.selectedAgentIndex.collectAsState()
     val savedSessions by viewModel.savedSessions.collectAsState()
     val maxTokens by viewModel.maxTokens.collectAsState()
+    val contextHistorySize by viewModel.contextHistorySize.collectAsState()
+    val maxContextTokens by viewModel.maxContextTokens.collectAsState()
     val pendingAttachments by viewModel.pendingAttachments.collectAsState()
     val isUploading by viewModel.isUploading.collectAsState()
     var inputText by remember { mutableStateOf("") }
@@ -123,7 +126,7 @@ fun AgentScreen(
 
         // Прогресс-бар контекстного окна
         if (totalDialogTokens > 0) {
-            ContextWindowBar(totalTokens = totalDialogTokens)
+            ContextWindowBar(totalTokens = totalDialogTokens, contextLimit = maxContextTokens)
             HorizontalDivider()
         }
 
@@ -133,7 +136,21 @@ fun AgentScreen(
             onMaxTokensChanged = { viewModel.setMaxTokens(it) },
         )
 
+        // Выбор размера контекстного окна истории
+        ContextSizeSelector(
+            contextHistorySize = contextHistorySize,
+            onChanged = { viewModel.setContextHistorySize(it) },
+        )
+
+        // Лимит токенов контекста (демо-режим)
+        MaxContextTokensSelector(
+            maxContextTokens = maxContextTokens,
+            onChanged = { viewModel.setMaxContextTokens(it) },
+        )
+
         HorizontalDivider()
+
+        val cutoffIndex = (messages.size - contextHistorySize).coerceAtLeast(0)
 
         LazyColumn(
             state = listState,
@@ -144,8 +161,15 @@ fun AgentScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             item { Spacer(Modifier.height(4.dp)) }
-            itemsIndexed(messages, key = { _, it -> it.id }) { _, message ->
-                MessageBubble(message = message)
+            itemsIndexed(messages, key = { _, it -> it.id }) { index, message ->
+                if (index == cutoffIndex && cutoffIndex > 0) {
+                    ContextBoundaryDivider()
+                }
+                MessageBubble(
+                    message = message,
+                    isInContext = index >= cutoffIndex,
+                    contextLimit = maxContextTokens,
+                )
             }
             if (isLoading) {
                 item {
@@ -292,7 +316,7 @@ private fun AgentHeader(
 @Composable
 private fun ContextWindowBar(
     totalTokens: Int,
-    contextLimit: Int = CONTEXT_WINDOW_LIMIT,
+    contextLimit: Int,
 ) {
     val fraction = (totalTokens.toFloat() / contextLimit).coerceIn(0f, 1f)
     val percent = (fraction * 100).toInt()
@@ -311,7 +335,7 @@ private fun ContextWindowBar(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text(
-                text = "Контекст диалога: $totalTokens / $contextLimit tok",
+                text = "Потрачено за сессию: $totalTokens tok",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -372,6 +396,94 @@ private fun MaxTokensSelector(
             } else {
                 OutlinedButton(
                     onClick = { onMaxTokensChanged(value) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                ) {
+                    Text(label, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+    }
+}
+
+// ── Выбор размера контекстного окна истории ────────────────────────────────────
+
+@Composable
+private fun ContextSizeSelector(
+    contextHistorySize: Int,
+    onChanged: (Int) -> Unit,
+) {
+    val options = listOf(0 to "0", 2 to "2", 4 to "4", 8 to "8", Int.MAX_VALUE to "∞")
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "ctx окно:",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(end = 2.dp),
+        )
+        options.forEach { (value, label) ->
+            val selected = contextHistorySize == value
+            if (selected) {
+                Button(
+                    onClick = { onChanged(value) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                ) {
+                    Text(label, style = MaterialTheme.typography.labelMedium)
+                }
+            } else {
+                OutlinedButton(
+                    onClick = { onChanged(value) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                ) {
+                    Text(label, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+    }
+}
+
+// ── Лимит токенов контекста ────────────────────────────────────────────────────
+
+@Composable
+private fun MaxContextTokensSelector(
+    maxContextTokens: Int,
+    onChanged: (Int) -> Unit,
+) {
+    val options = listOf(500 to "500", 2000 to "2k", 8000 to "8k", 32768 to "32k")
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "ctx лимит:",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(end = 2.dp),
+        )
+        options.forEach { (value, label) ->
+            val selected = maxContextTokens == value
+            if (selected) {
+                Button(
+                    onClick = { onChanged(value) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                ) {
+                    Text(label, style = MaterialTheme.typography.labelMedium)
+                }
+            } else {
+                OutlinedButton(
+                    onClick = { onChanged(value) },
                     modifier = Modifier.height(32.dp),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                 ) {
@@ -530,9 +642,15 @@ private fun AttachmentChips(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun MessageBubble(message: ChatMessage) {
+private fun MessageBubble(
+    message: ChatMessage,
+    isInContext: Boolean,
+    contextLimit: Int,
+) {
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .alpha(if (isInContext) 1f else 0.4f),
         horizontalAlignment = if (message.isUser) Alignment.End else Alignment.Start,
     ) {
         // Чипы вложений (только для сообщений с файлами)
@@ -561,10 +679,11 @@ private fun MessageBubble(message: ChatMessage) {
             modifier = Modifier
                 .widthIn(max = 300.dp)
                 .background(
-                    color = if (message.isUser)
-                        MaterialTheme.colorScheme.primaryContainer
-                    else
-                        MaterialTheme.colorScheme.surfaceVariant,
+                    color = when {
+                        message.isContextOverflow -> MaterialTheme.colorScheme.errorContainer
+                        message.isUser -> MaterialTheme.colorScheme.primaryContainer
+                        else -> MaterialTheme.colorScheme.surfaceVariant
+                    },
                     shape = RoundedCornerShape(
                         topStart = 16.dp,
                         topEnd = 16.dp,
@@ -613,7 +732,15 @@ private fun MessageBubble(message: ChatMessage) {
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                MiniContextBar(
+                    historyTokens = message.historyTokens,
+                    contextLimit = contextLimit,
+                )
             }
+        }
+
+        if (!message.isUser && message.finishedByLength) {
+            TruncatedBadge()
         }
     }
 }
@@ -689,6 +816,86 @@ private fun NoContextCard(answer: String, tokens: Int) {
                 }
             }
         }
+    }
+}
+
+// ── Мини-бар контекста под сообщением ─────────────────────────────────────────
+
+@Composable
+private fun MiniContextBar(historyTokens: Int, contextLimit: Int) {
+    val fraction = (historyTokens.toFloat() / contextLimit).coerceIn(0f, 1f)
+    val color = when {
+        fraction > 0.8f -> MaterialTheme.colorScheme.error
+        fraction > 0.5f -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.primary
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier.padding(top = 2.dp),
+    ) {
+        LinearProgressIndicator(
+            progress = { fraction },
+            modifier = Modifier
+                .width(72.dp)
+                .height(3.dp)
+                .clip(RoundedCornerShape(2.dp)),
+            color = color,
+            trackColor = MaterialTheme.colorScheme.surfaceVariant,
+        )
+        Text(
+            text = "${(fraction * 100).toInt()}% ctx",
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+        )
+    }
+}
+
+// ── Бейдж обрезки ответа ───────────────────────────────────────────────────────
+
+@Composable
+private fun TruncatedBadge() {
+    Box(
+        modifier = Modifier
+            .padding(top = 3.dp, start = 4.dp)
+            .background(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = RoundedCornerShape(4.dp),
+            )
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
+        Text(
+            text = "⚠ ответ обрублен (max_tokens)",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onErrorContainer,
+        )
+    }
+}
+
+// ── Разделитель «забыто / в контексте» ────────────────────────────────────────
+
+@Composable
+private fun ContextBoundaryDivider() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            color = MaterialTheme.colorScheme.error.copy(alpha = 0.4f),
+        )
+        Text(
+            text = "ниже — активный контекст",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.error,
+        )
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            color = MaterialTheme.colorScheme.error.copy(alpha = 0.4f),
+        )
     }
 }
 

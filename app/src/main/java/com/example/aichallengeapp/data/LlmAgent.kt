@@ -31,6 +31,8 @@ data class AgentResult(
     val requestTokens: Int,
     /** Сумма completion_tokens по обоим шагам (THINK + ANSWER). */
     val completionTokens: Int,
+    /** true, если ответ обрублен по лимиту max_tokens (finish_reason = "length"). */
+    val finishedByLength: Boolean = false,
 )
 
 /**
@@ -42,8 +44,8 @@ data class AgentResult(
  */
 class LlmAgent(val config: AgentConfig) {
 
-    /** Количество последних сообщений истории, передаваемых в контекст (2 пары user/assistant). */
-    val contextHistorySize: Int = 4
+    /** Количество последних сообщений истории, передаваемых в контекст. */
+    var contextHistorySize: Int = 4
 
     private val history = mutableListOf<MessageObj>()
 
@@ -109,7 +111,8 @@ class LlmAgent(val config: AgentConfig) {
             model = config.model,
             maxTokens = maxTokens,
         )
-        val answer = answerResponse.choices.firstOrNull()?.message?.content.orEmpty()
+        val answerChoice = answerResponse.choices.firstOrNull()
+        val answer = answerChoice?.message?.content.orEmpty()
         val answerTokens = answerResponse.usage?.totalTokens ?: 0
         totalTokens += answerTokens
         steps += AgentStep(StepType.ANSWER, answer, answerTokens)
@@ -127,6 +130,7 @@ class LlmAgent(val config: AgentConfig) {
             elapsedMs = System.currentTimeMillis() - startMs,
             requestTokens = requestTokens,
             completionTokens = completionTokens,
+            finishedByLength = answerChoice?.finishReason == "length",
         )
     }
 
