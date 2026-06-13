@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.aichallengeapp.data.AgentStep
+import com.example.aichallengeapp.data.ContextStrategy
 import com.example.aichallengeapp.data.StepType
 
 
@@ -81,10 +82,14 @@ fun AgentScreen(
     val maxContextTokens by viewModel.maxContextTokens.collectAsState()
     val pendingAttachments by viewModel.pendingAttachments.collectAsState()
     val isUploading by viewModel.isUploading.collectAsState()
-    val compressionEnabled by viewModel.compressionEnabled.collectAsState()
+    val strategy by viewModel.strategy.collectAsState()
     val summarizeEvery by viewModel.summarizeEvery.collectAsState()
     val currentSummary by viewModel.currentSummary.collectAsState()
     val summaryTokensTotal by viewModel.summaryTokensTotal.collectAsState()
+    val currentFacts by viewModel.currentFacts.collectAsState()
+    val factsTokensTotal by viewModel.factsTokensTotal.collectAsState()
+    val branches by viewModel.branches.collectAsState()
+    val currentBranchId by viewModel.currentBranchId.collectAsState()
     var inputText by remember { mutableStateOf("") }
     var showHistory by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
@@ -158,19 +163,45 @@ fun AgentScreen(
             onChanged = { viewModel.setMaxContextTokens(it) },
         )
 
-        // Сжатие истории (тумблер + параметры)
-        CompressionSelector(
-            enabled = compressionEnabled,
-            summarizeEvery = summarizeEvery,
-            onEnabledChanged = { viewModel.setCompressionEnabled(it) },
-            onSummarizeEveryChanged = { viewModel.setSummarizeEvery(it) },
+        // Селектор стратегии управления контекстом
+        StrategySelector(
+            selected = strategy,
+            onSelected = { viewModel.setStrategy(it) },
         )
 
+        // Параметры стратегии SUMMARY: каждые сколько сообщений пересчитывать сводку
+        if (strategy == ContextStrategy.SUMMARY) {
+            SummarizeEverySelector(
+                summarizeEvery = summarizeEvery,
+                onChanged = { viewModel.setSummarizeEvery(it) },
+            )
+        }
+
+        // Чипы веток (только в режиме BRANCHING)
+        if (strategy == ContextStrategy.BRANCHING) {
+            BranchesBar(
+                branches = branches,
+                currentBranchId = currentBranchId,
+                onSwitch = { viewModel.switchBranch(it) },
+                onFork = { viewModel.forkBranch(it) },
+                onDelete = { viewModel.deleteBranch(it) },
+                enabled = !isLoading,
+            )
+        }
+
         // Карточка с актуальным summary
-        if (compressionEnabled && !currentSummary.isNullOrBlank()) {
+        if (strategy == ContextStrategy.SUMMARY && !currentSummary.isNullOrBlank()) {
             SummaryCard(
                 summary = currentSummary.orEmpty(),
                 summaryTokensTotal = summaryTokensTotal,
+            )
+        }
+
+        // Карточка с актуальными липкими фактами
+        if (strategy == ContextStrategy.STICKY_FACTS && !currentFacts.isNullOrBlank()) {
+            FactsCard(
+                facts = currentFacts.orEmpty(),
+                factsTokensTotal = factsTokensTotal,
             )
         }
 
@@ -292,46 +323,71 @@ private fun AgentHeader(
 ) {
     var dropdownExpanded by remember { mutableStateOf(false) }
 
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        OutlinedButton(onClick = onBack) { Text("←") }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        // Верхняя строка: назад + выбор агента.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(onClick = onBack) { Text("←") }
 
-        Box(modifier = Modifier.weight(1f)) {
-            OutlinedButton(
-                onClick = { if (!isLoading) dropdownExpanded = true },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !isLoading,
-            ) {
-                Text("Агент: ${agentNames[selectedIndex]}")
-            }
-            DropdownMenu(
-                expanded = dropdownExpanded,
-                onDismissRequest = { dropdownExpanded = false },
-            ) {
-                agentNames.forEachIndexed { index, name ->
-                    DropdownMenuItem(
-                        text = { Text(name) },
-                        onClick = {
-                            onAgentSelected(index)
-                            dropdownExpanded = false
-                        },
+            Box(modifier = Modifier.weight(1f)) {
+                OutlinedButton(
+                    onClick = { if (!isLoading) dropdownExpanded = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isLoading,
+                ) {
+                    Text(
+                        text = "Агент: ${agentNames[selectedIndex]}",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
+                }
+                DropdownMenu(
+                    expanded = dropdownExpanded,
+                    onDismissRequest = { dropdownExpanded = false },
+                ) {
+                    agentNames.forEachIndexed { index, name ->
+                        DropdownMenuItem(
+                            text = { Text(name) },
+                            onClick = {
+                                onAgentSelected(index)
+                                dropdownExpanded = false
+                            },
+                        )
+                    }
                 }
             }
         }
 
-        OutlinedButton(onClick = onShowHistory, enabled = !isLoading) {
-            Text("История")
-        }
-
-        if (hasMessages) {
-            OutlinedButton(onClick = onClear, enabled = !isLoading) {
-                Text("Очистить")
+        // Нижняя строка: действия. Каждая кнопка занимает равную долю ширины.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = onShowHistory,
+                enabled = !isLoading,
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+            ) {
+                Text("История", maxLines = 1)
+            }
+            if (hasMessages) {
+                OutlinedButton(
+                    onClick = onClear,
+                    enabled = !isLoading,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                ) {
+                    Text("Очистить", maxLines = 1)
+                }
             }
         }
     }
@@ -967,14 +1023,55 @@ private fun ThinkingIndicator(agentName: String) {
     }
 }
 
-// ── Сжатие истории: настройки ─────────────────────────────────────────────────
+// ── Стратегия управления контекстом ───────────────────────────────────────────
 
 @Composable
-private fun CompressionSelector(
-    enabled: Boolean,
+private fun StrategySelector(
+    selected: ContextStrategy,
+    onSelected: (ContextStrategy) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "стратегия:",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(end = 2.dp),
+        )
+        ContextStrategy.values().forEach { option ->
+            val isSelected = option == selected
+            if (isSelected) {
+                Button(
+                    onClick = { onSelected(option) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                ) {
+                    Text(option.label, style = MaterialTheme.typography.labelMedium)
+                }
+            } else {
+                OutlinedButton(
+                    onClick = { onSelected(option) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                ) {
+                    Text(option.label, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+    }
+}
+
+// ── Параметр «каждые N сообщений пересчитывать summary» ───────────────────────
+
+@Composable
+private fun SummarizeEverySelector(
     summarizeEvery: Int,
-    onEnabledChanged: (Boolean) -> Unit,
-    onSummarizeEveryChanged: (Int) -> Unit,
+    onChanged: (Int) -> Unit,
 ) {
     val options = listOf(5, 10, 20)
     Row(
@@ -985,53 +1082,180 @@ private fun CompressionSelector(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text(
-            text = "сжатие:",
+            text = "summary каждые:",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(end = 2.dp),
         )
-        if (enabled) {
-            Button(
-                onClick = { onEnabledChanged(false) },
-                modifier = Modifier.height(32.dp),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-            ) {
-                Text("вкл", style = MaterialTheme.typography.labelMedium)
-            }
-        } else {
-            OutlinedButton(
-                onClick = { onEnabledChanged(true) },
-                modifier = Modifier.height(32.dp),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-            ) {
-                Text("выкл", style = MaterialTheme.typography.labelMedium)
-            }
-        }
-        Spacer(Modifier.width(4.dp))
-        Text(
-            text = "каждые",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
         options.forEach { value ->
-            val selected = summarizeEvery == value
-            if (selected) {
+            val isSelected = summarizeEvery == value
+            if (isSelected) {
                 Button(
-                    onClick = { onSummarizeEveryChanged(value) },
+                    onClick = { onChanged(value) },
                     modifier = Modifier.height(32.dp),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                    enabled = enabled,
                 ) {
                     Text("$value", style = MaterialTheme.typography.labelMedium)
                 }
             } else {
                 OutlinedButton(
-                    onClick = { onSummarizeEveryChanged(value) },
+                    onClick = { onChanged(value) },
                     modifier = Modifier.height(32.dp),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                    enabled = enabled,
                 ) {
                     Text("$value", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+    }
+}
+
+// ── Ветки диалога ─────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun BranchesBar(
+    branches: List<DialogBranch>,
+    currentBranchId: String?,
+    onSwitch: (String) -> Unit,
+    onFork: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    enabled: Boolean,
+) {
+    var showForkDialog by remember { mutableStateOf(false) }
+    var forkName by remember { mutableStateOf("") }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "ветки:",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(
+                onClick = {
+                    forkName = "branch ${branches.size + 1}"
+                    showForkDialog = true
+                },
+                modifier = Modifier.height(28.dp),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                enabled = enabled && branches.isNotEmpty(),
+            ) {
+                Text("+ ветвь", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            branches.forEach { branch ->
+                val isCurrent = branch.id == currentBranchId
+                InputChip(
+                    selected = isCurrent,
+                    onClick = { if (enabled) onSwitch(branch.id) },
+                    label = {
+                        Text(
+                            text = branch.name,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    },
+                    trailingIcon = if (branches.size > 1 && isCurrent) {
+                        {
+                            Text(
+                                text = "✕",
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.clickable(enabled = enabled) {
+                                    onDelete(branch.id)
+                                },
+                            )
+                        }
+                    } else null,
+                )
+            }
+        }
+    }
+
+    if (showForkDialog) {
+        Dialog(onDismissRequest = { showForkDialog = false }) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Новая ветка от текущего места",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = forkName,
+                        onValueChange = { forkName = it },
+                        label = { Text("Название ветки") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        TextButton(onClick = { showForkDialog = false }) {
+                            Text("Отмена")
+                        }
+                        TextButton(onClick = {
+                            onFork(forkName)
+                            showForkDialog = false
+                        }) {
+                            Text("Создать")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Карточка липких фактов ────────────────────────────────────────────────────
+
+@Composable
+private fun FactsCard(facts: String, factsTokensTotal: Int) {
+    var expanded by remember { mutableStateOf(true) }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+            TextButton(
+                onClick = { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = if (expanded) "Ключевые факты ▲"
+                    else "Ключевые факты (накладные: $factsTokensTotal tok) ▼",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(modifier = Modifier.padding(bottom = 6.dp)) {
+                    Text(
+                        text = facts,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Потрачено на facts: $factsTokensTotal tok",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
                 }
             }
         }

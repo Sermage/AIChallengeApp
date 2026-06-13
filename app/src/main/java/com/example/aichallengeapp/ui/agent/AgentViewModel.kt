@@ -6,8 +6,11 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.aichallengeapp.data.AgentConfig
+import com.example.aichallengeapp.data.AgentResult
+import com.example.aichallengeapp.data.AgentStateSnapshot
 import com.example.aichallengeapp.data.AgentStep
 import com.example.aichallengeapp.data.CompressionConfig
+import com.example.aichallengeapp.data.ContextStrategy
 import com.example.aichallengeapp.data.GigaChatClient
 import com.example.aichallengeapp.data.LlmAgent
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -83,6 +86,24 @@ data class ChatMessage(
     val estimatedFullPromptTokens: Int = 0,
     /** true, если к моменту запроса часть истории уже свёрнута в summary. */
     val historyFolded: Boolean = false,
+    /** Накладные расходы на обновление словаря фактов в этом ходе. */
+    val factsTokens: Int = 0,
+    /** Снимок словаря фактов после этого хода (STICKY_FACTS). */
+    val factsSnapshot: String? = null,
+    /** Стратегия контекста, при которой был сделан этот ход. */
+    val strategy: ContextStrategy = ContextStrategy.SLIDING_WINDOW,
+    /** ID ветки, в которой был сделан этот ход (для BRANCHING). */
+    val branchId: String? = null,
+)
+
+/** Чекпоинт + независимая ветка диалога для стратегии BRANCHING. */
+data class DialogBranch(
+    val id: String,
+    val name: String,
+    val parentId: String?,
+    val createdAt: Long,
+    val messages: List<ChatMessage>,
+    val agentState: AgentStateSnapshot,
 )
 
 @HiltViewModel
@@ -97,9 +118,6 @@ class AgentViewModel @Inject constructor(
     val isLoading: StateFlow<Boolean> = _isLoading
 
     private val agents = PRESET_AGENTS.map { LlmAgent(it) }
-
-    /** Зеркальный набор агентов с включённой компрессией — для A/B-сравнения. */
-    private val compressedAgents = PRESET_AGENTS.map { LlmAgent(it) }
 
     private val _selectedAgentIndex = MutableStateFlow(0)
     val selectedAgentIndex: StateFlow<Int> = _selectedAgentIndex
@@ -116,11 +134,11 @@ class AgentViewModel @Inject constructor(
     private val _maxContextTokens = MutableStateFlow(32768)
     val maxContextTokens: StateFlow<Int> = _maxContextTokens
 
-    /** Включена ли компрессия истории (запускает параллельный «сжатый» агент). */
-    private val _compressionEnabled = MutableStateFlow(false)
-    val compressionEnabled: StateFlow<Boolean> = _compressionEnabled
+    /** Активная стратегия управления контекстом. */
+    private val _strategy = MutableStateFlow(ContextStrategy.SLIDING_WINDOW)
+    val strategy: StateFlow<ContextStrategy> = _strategy
 
-    /** Каждые сколько сообщений пересчитывать summary. */
+    /** Каждые сколько сообщений пересчитывать summary (только для SUMMARY). */
     private val _summarizeEvery = MutableStateFlow(10)
     val summarizeEvery: StateFlow<Int> = _summarizeEvery
 
@@ -131,6 +149,22 @@ class AgentViewModel @Inject constructor(
     /** Сколько суммарно токенов потрачено на генерацию summary за сессию. */
     private val _summaryTokensTotal = MutableStateFlow(0)
     val summaryTokensTotal: StateFlow<Int> = _summaryTokensTotal
+
+    /** Текущий словарь «липких фактов» для стратегии STICKY_FACTS. */
+    private val _currentFacts = MutableStateFlow<String?>(null)
+    val currentFacts: StateFlow<String?> = _currentFacts
+
+    /** Сколько суммарно токенов потрачено на обновление facts за сессию. */
+    private val _factsTokensTotal = MutableStateFlow(0)
+    val factsTokensTotal: StateFlow<Int> = _factsTokensTotal
+
+    /** Список веток диалога (для стратегии BRANCHING). */
+    private val _branches = MutableStateFlow<List<DialogBranch>>(emptyList())
+    val branches: StateFlow<List<DialogBranch>> = _branches
+
+    /** ID активной ветки (null, если стратегия не BRANCHING или веток ещё нет). */
+    private val _currentBranchId = MutableStateFlow<String?>(null)
+    val currentBranchId: StateFlow<String?> = _currentBranchId
 
     /** Файлы, ожидающие отправки вместе со следующим сообщением. */
     private val _pendingAttachments = MutableStateFlow<List<PendingAttachment>>(emptyList())
@@ -149,7 +183,7 @@ class AgentViewModel @Inject constructor(
 
     init {
         _savedSessions.value = SessionStorage.loadAll(context)
-        applyCompressionConfig()
+        applyStrategy()
     }
 
     fun selectAgent(index: Int) {
@@ -158,10 +192,14 @@ class AgentViewModel @Inject constructor(
         _selectedAgentIndex.value = index
         _messages.value = emptyList()
         agents[index].reset()
-        compressedAgents[index].reset()
         _currentSummary.value = null
         _summaryTokensTotal.value = 0
+        _currentFacts.value = null
+        _factsTokensTotal.value = 0
+        _branches.value = emptyList()
+        _currentBranchId.value = null
         currentSessionId = System.currentTimeMillis()
+        applyStrategy()
     }
 
     fun setMaxTokens(value: Int?) {
@@ -171,31 +209,39 @@ class AgentViewModel @Inject constructor(
     fun setContextHistorySize(value: Int) {
         _contextHistorySize.value = value
         agents.forEach { it.contextHistorySize = value }
-        compressedAgents.forEach { it.contextHistorySize = value }
-        applyCompressionConfig()
+        applyStrategy()
     }
 
     fun setMaxContextTokens(value: Int) {
         _maxContextTokens.value = value
     }
 
-    fun setCompressionEnabled(value: Boolean) {
-        _compressionEnabled.value = value
-        applyCompressionConfig()
+    fun setStrategy(value: ContextStrategy) {
+        if (_strategy.value == value) return
+        _strategy.value = value
+        applyStrategy()
+        // При входе в режим BRANCHING — если веток ещё нет, создаём «главную» из текущего состояния.
+        if (value == ContextStrategy.BRANCHING && _branches.value.isEmpty()) {
+            initMainBranch()
+        }
     }
 
     fun setSummarizeEvery(value: Int) {
         _summarizeEvery.value = value
-        applyCompressionConfig()
+        applyStrategy()
     }
 
-    private fun applyCompressionConfig() {
+    private fun applyStrategy() {
         val cfg = CompressionConfig(
             keepLastN = _contextHistorySize.value.coerceAtLeast(2),
             summarizeEvery = _summarizeEvery.value,
-            enabled = true, // у compressedAgents всегда включено — сравнение vs. agents без сжатия
+            enabled = _strategy.value == ContextStrategy.SUMMARY,
         )
-        compressedAgents.forEach { it.compressionConfig = cfg }
+        agents.forEach {
+            it.compressionConfig = cfg
+            it.strategy = _strategy.value
+            it.contextHistorySize = _contextHistorySize.value
+        }
     }
 
     /** Загружает файл по URI в Files API и добавляет в список ожидающих вложений. */
@@ -222,12 +268,23 @@ class AgentViewModel @Inject constructor(
 
     fun send(query: String) {
         if (query.isBlank() || _isLoading.value) return
+        viewModelScope.launch { performTurn(query, _pendingAttachments.value) }
+    }
+
+    /**
+     * Один ход: добавляет user-сообщение, дёргает агента, пишет ответ в список,
+     * обновляет summary/facts/ветки.
+     * Возвращает true, если ход успешно выполнен.
+     */
+    private suspend fun performTurn(
+        query: String,
+        attachments: List<PendingAttachment>,
+    ): Boolean {
         val agent = agents[_selectedAgentIndex.value]
-        val compressedAgent = compressedAgents[_selectedAgentIndex.value]
         val maxTok = _maxTokens.value
-        val attachments = _pendingAttachments.value
         _pendingAttachments.value = emptyList()
-        val withCompression = _compressionEnabled.value
+        val activeStrategy = _strategy.value
+        val activeBranchId = _currentBranchId.value
 
         val spentTokens = _messages.value.filterNot { it.isUser }.sumOf { it.totalTokens }
         val limit = _maxContextTokens.value
@@ -238,7 +295,7 @@ class AgentViewModel @Inject constructor(
                         "Очистите историю чтобы продолжить.",
                 isContextOverflow = true,
             )
-            return
+            return false
         }
 
         val fileIds = attachments.map { it.fileId }
@@ -248,85 +305,228 @@ class AgentViewModel @Inject constructor(
             isUser = true,
             text = query,
             attachmentNames = attachmentNames,
+            strategy = activeStrategy,
+            branchId = activeBranchId,
         )
         _isLoading.value = true
 
-        viewModelScope.launch {
-            runCatching {
-                // Один запрос на ход: либо обычный агент, либо сжатый — в зависимости от флага.
-                if (withCompression) {
-                    compressedAgent.run(query, maxTok, fileIds)
-                } else {
-                    agent.run(query, maxTok, fileIds)
-                }
+        val outcome = runCatching { agent.run(query, maxTok, fileIds) }
+        handleTurnOutcome(outcome, activeStrategy, activeBranchId)
+        _isLoading.value = false
+        return outcome.isSuccess
+    }
+
+    private fun handleTurnOutcome(
+        outcome: Result<AgentResult>,
+        activeStrategy: ContextStrategy,
+        activeBranchId: String?,
+    ) {
+        outcome
+            .onSuccess { result -> appendAssistantMessage(result, activeStrategy, activeBranchId) }
+            .onFailure { error ->
+                _messages.value = _messages.value + ChatMessage(
+                    isUser = false,
+                    text = "Ошибка: ${error.message ?: "Неизвестная ошибка"}",
+                    strategy = activeStrategy,
+                    branchId = activeBranchId,
+                )
             }
-                .onSuccess { result ->
-                    val historyTokens = _messages.value.filterNot { it.isUser }
-                        .sumOf { it.totalTokens } + result.totalTokens
+    }
 
-                    if (result.summarySnapshot != null) {
-                        _currentSummary.value = result.summarySnapshot
-                    }
-                    if (result.summaryTokens > 0) {
-                        _summaryTokensTotal.value =
-                            _summaryTokensTotal.value + result.summaryTokens
-                    }
+    private fun appendAssistantMessage(
+        result: AgentResult,
+        activeStrategy: ContextStrategy,
+        activeBranchId: String?,
+    ) {
+        val historyTokens = _messages.value.filterNot { it.isUser }
+            .sumOf { it.totalTokens } + result.totalTokens
 
-                    _messages.value = _messages.value + ChatMessage(
-                        isUser = false,
-                        text = result.answer,
-                        steps = result.steps,
-                        totalTokens = result.totalTokens,
-                        elapsedMs = result.elapsedMs,
-                        requestTokens = result.requestTokens,
-                        completionTokens = result.completionTokens,
-                        historyTokens = historyTokens,
-                        finishedByLength = result.finishedByLength,
-                        compressedSummaryTokens = result.summaryTokens,
-                        summarySnapshot = result.summarySnapshot,
-                        compressionUsed = withCompression,
-                        thinkPromptTokens = result.thinkPromptTokens,
-                        estimatedFullPromptTokens = result.estimatedFullPromptTokens,
-                        historyFolded = result.historyFolded,
-                    )
-                    saveCurrentSession()
-                }
-                .onFailure { error ->
-                    _messages.value = _messages.value + ChatMessage(
-                        isUser = false,
-                        text = "Ошибка: ${error.message ?: "Неизвестная ошибка"}",
-                    )
-                }
-            _isLoading.value = false
+        if (result.summarySnapshot != null) {
+            _currentSummary.value = result.summarySnapshot
         }
+        if (result.summaryTokens > 0) {
+            _summaryTokensTotal.value = _summaryTokensTotal.value + result.summaryTokens
+        }
+        if (result.factsSnapshot != null) {
+            _currentFacts.value = result.factsSnapshot
+        }
+        if (result.factsTokens > 0) {
+            _factsTokensTotal.value = _factsTokensTotal.value + result.factsTokens
+        }
+
+        _messages.value = _messages.value + ChatMessage(
+            isUser = false,
+            text = result.answer,
+            steps = result.steps,
+            totalTokens = result.totalTokens,
+            elapsedMs = result.elapsedMs,
+            requestTokens = result.requestTokens,
+            completionTokens = result.completionTokens,
+            historyTokens = historyTokens,
+            finishedByLength = result.finishedByLength,
+            compressedSummaryTokens = result.summaryTokens,
+            summarySnapshot = result.summarySnapshot,
+            compressionUsed = activeStrategy == ContextStrategy.SUMMARY,
+            thinkPromptTokens = result.thinkPromptTokens,
+            estimatedFullPromptTokens = result.estimatedFullPromptTokens,
+            historyFolded = result.historyFolded,
+            factsTokens = result.factsTokens,
+            factsSnapshot = result.factsSnapshot,
+            strategy = activeStrategy,
+            branchId = activeBranchId,
+        )
+
+        if (activeStrategy == ContextStrategy.BRANCHING && activeBranchId != null) {
+            syncCurrentBranchState()
+        }
+        saveCurrentSession()
     }
 
     fun clearHistory() {
         _messages.value = emptyList()
         _pendingAttachments.value = emptyList()
         agents[_selectedAgentIndex.value].reset()
-        compressedAgents[_selectedAgentIndex.value].reset()
         _currentSummary.value = null
         _summaryTokensTotal.value = 0
+        _currentFacts.value = null
+        _factsTokensTotal.value = 0
+        _branches.value = emptyList()
+        _currentBranchId.value = null
         currentSessionId = System.currentTimeMillis()
+        if (_strategy.value == ContextStrategy.BRANCHING) initMainBranch()
     }
 
     fun loadSession(session: ChatSession) {
         val agentIndex = PRESET_AGENTS.indexOfFirst { it.name == session.agentName }
         if (agentIndex >= 0) {
             agents[_selectedAgentIndex.value].reset()
-            compressedAgents[_selectedAgentIndex.value].reset()
             _selectedAgentIndex.value = agentIndex
-            val users = session.messages.filter { it.isUser }.map { it.text }
-            val assistants = session.messages.filter { !it.isUser }.map { it.text }
-            agents[agentIndex].restoreHistory(users.zip(assistants))
-            compressedAgents[agentIndex].restoreHistory(users.zip(assistants))
         }
+
+        // Восстанавливаем конфигурацию, если она сохранена.
+        session.config?.let { cfg ->
+            _maxTokens.value = cfg.maxTokens
+            _contextHistorySize.value = cfg.contextHistorySize
+            _maxContextTokens.value = cfg.maxContextTokens
+            _strategy.value = cfg.strategy
+            _summarizeEvery.value = cfg.summarizeEvery
+        }
+
         _messages.value = session.messages
         _currentSummary.value =
             session.messages.lastOrNull { it.summarySnapshot != null }?.summarySnapshot
         _summaryTokensTotal.value = session.messages.sumOf { it.compressedSummaryTokens }
+        _currentFacts.value =
+            session.messages.lastOrNull { it.factsSnapshot != null }?.factsSnapshot
+        _factsTokensTotal.value = session.messages.sumOf { it.factsTokens }
+
+        // Восстанавливаем ветки; для каждой ветки также восстанавливаем агента.
+        if (session.branches.isNotEmpty()) {
+            _branches.value = session.branches
+            _currentBranchId.value = session.currentBranchId
+            val activeBranch = session.branches.firstOrNull { it.id == session.currentBranchId }
+                ?: session.branches.first()
+            if (agentIndex >= 0) {
+                agents[agentIndex].restoreState(
+                    rawHistory = activeBranch.agentState.history,
+                    summary = activeBranch.agentState.summary,
+                    facts = activeBranch.agentState.facts,
+                    foldedCount = activeBranch.agentState.foldedCount,
+                )
+            }
+        } else {
+            _branches.value = emptyList()
+            _currentBranchId.value = null
+            if (agentIndex >= 0) {
+                val users = session.messages.filter { it.isUser }.map { it.text }
+                val assistants = session.messages.filter { !it.isUser }.map { it.text }
+                agents[agentIndex].restoreHistory(users.zip(assistants))
+            }
+        }
+
         currentSessionId = session.id
+        applyStrategy()
+    }
+
+    // ── Ветки диалога ────────────────────────────────────────────────────────
+
+    /** Создаёт «главную» ветку из текущего состояния (вызывается при входе в BRANCHING). */
+    private fun initMainBranch() {
+        val agent = agents[_selectedAgentIndex.value]
+        val main = DialogBranch(
+            id = "main-${System.currentTimeMillis()}",
+            name = "main",
+            parentId = null,
+            createdAt = System.currentTimeMillis(),
+            messages = _messages.value,
+            agentState = agent.snapshotState(),
+        )
+        _branches.value = listOf(main)
+        _currentBranchId.value = main.id
+    }
+
+    /**
+     * Сохраняет чекпоинт и создаёт новую ветку, разветвляясь от текущего состояния.
+     * После вызова активна именно новая ветка, чтобы пользователь сразу мог в ней писать.
+     */
+    fun forkBranch(name: String) {
+        if (_strategy.value != ContextStrategy.BRANCHING) return
+        // Прежде всего — фиксируем текущее состояние родительской ветки.
+        syncCurrentBranchState()
+        val parentId = _currentBranchId.value
+        val agent = agents[_selectedAgentIndex.value]
+        val branch = DialogBranch(
+            id = "br-${System.currentTimeMillis()}",
+            name = name.ifBlank { "branch ${_branches.value.size + 1}" },
+            parentId = parentId,
+            createdAt = System.currentTimeMillis(),
+            messages = _messages.value,
+            agentState = agent.snapshotState(),
+        )
+        _branches.value = _branches.value + branch
+        _currentBranchId.value = branch.id
+    }
+
+    /** Переключается на указанную ветку — восстанавливает её сообщения и состояние агента. */
+    fun switchBranch(branchId: String) {
+        if (_strategy.value != ContextStrategy.BRANCHING) return
+        if (branchId == _currentBranchId.value) return
+        // Сохраняем состояние текущей ветки перед переключением.
+        syncCurrentBranchState()
+        val target = _branches.value.firstOrNull { it.id == branchId } ?: return
+        _messages.value = target.messages
+        agents[_selectedAgentIndex.value].restoreState(
+            rawHistory = target.agentState.history,
+            summary = target.agentState.summary,
+            facts = target.agentState.facts,
+            foldedCount = target.agentState.foldedCount,
+        )
+        _currentSummary.value = target.agentState.summary
+        _currentFacts.value = target.agentState.facts
+        _currentBranchId.value = branchId
+    }
+
+    fun deleteBranch(branchId: String) {
+        val list = _branches.value
+        if (list.size <= 1) return
+        val remaining = list.filterNot { it.id == branchId }
+        _branches.value = remaining
+        if (_currentBranchId.value == branchId) {
+            switchBranch(remaining.first().id)
+        }
+    }
+
+    /** Синхронизирует снимок активной ветки с текущим состоянием экрана и агента. */
+    private fun syncCurrentBranchState() {
+        val id = _currentBranchId.value ?: return
+        val list = _branches.value
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        val updated = list[idx].copy(
+            messages = _messages.value,
+            agentState = agents[_selectedAgentIndex.value].snapshotState(),
+        )
+        _branches.value = list.toMutableList().also { it[idx] = updated }
     }
 
     private fun resolveDisplayName(uri: Uri): String {
@@ -340,11 +540,21 @@ class AgentViewModel @Inject constructor(
     private fun saveCurrentSession() {
         val msgs = _messages.value
         if (msgs.isEmpty()) return
+        val config = ChatConfig(
+            maxTokens = _maxTokens.value,
+            contextHistorySize = _contextHistorySize.value,
+            maxContextTokens = _maxContextTokens.value,
+            strategy = _strategy.value,
+            summarizeEvery = _summarizeEvery.value,
+        )
         val session = ChatSession(
             id = currentSessionId,
             agentName = agentNames[_selectedAgentIndex.value],
             timestamp = currentSessionId,
             messages = msgs,
+            config = config,
+            branches = _branches.value,
+            currentBranchId = _currentBranchId.value,
         )
         SessionStorage.save(context, session)
         _savedSessions.value = SessionStorage.loadAll(context)

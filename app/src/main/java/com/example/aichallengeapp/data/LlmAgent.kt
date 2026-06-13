@@ -21,6 +21,21 @@ data class AgentStep(
     val tokens: Int = 0,
 )
 
+/** Стратегия управления контекстным окном диалога. */
+enum class ContextStrategy(val label: String) {
+    /** Передавать только последние N сообщений, остальное отбрасывать. */
+    SLIDING_WINDOW("Окно"),
+
+    /** Поддерживать словарь ключевых фактов и слать его + последние N сообщений. */
+    STICKY_FACTS("Факты"),
+
+    /** Несколько независимых веток диалога с чекпоинтами и переключением. */
+    BRANCHING("Ветки"),
+
+    /** Сжимать старые сообщения в summary, передавать summary + последние N. */
+    SUMMARY("Сводка"),
+}
+
 /** Итог работы агента за один запрос. */
 data class AgentResult(
     val steps: List<AgentStep>,
@@ -50,6 +65,10 @@ data class AgentResult(
     val estimatedFullPromptTokens: Int = 0,
     /** true, если к моменту этого вызова часть истории уже была свёрнута в summary. */
     val historyFolded: Boolean = false,
+    /** Накладные расходы на обновление словаря фактов в этом запросе. */
+    val factsTokens: Int = 0,
+    /** Актуальный словарь фактов после этого вызова (если стратегия — STICKY_FACTS). */
+    val factsSnapshot: String? = null,
 )
 
 /**
@@ -63,13 +82,17 @@ data class AgentResult(
 class LlmAgent(
     val config: AgentConfig,
     private val compressor: HistoryCompressor = HistoryCompressor(),
+    private val factsExtractor: FactsExtractor = FactsExtractor(),
 ) {
 
     /** Количество последних сообщений истории, передаваемых в контекст «как есть». */
     var contextHistorySize: Int = 4
 
-    /** Параметры сжатия истории. Если enabled=false — агент работает по старой логике. */
+    /** Параметры сжатия истории — используются только в стратегии SUMMARY. */
     var compressionConfig: CompressionConfig = CompressionConfig(enabled = false)
+
+    /** Активная стратегия управления контекстом. */
+    var strategy: ContextStrategy = ContextStrategy.SLIDING_WINDOW
 
     private val history = mutableListOf<MessageObj>()
 
@@ -84,6 +107,14 @@ class LlmAgent(
     /** Сколько сообщений из начала истории уже учтено в summary. */
     private var foldedCount: Int = 0
 
+    /** Текущий словарь «липких фактов» (null, пока не было ни одного хода). */
+    var facts: String? = null
+        private set
+
+    /** Суммарный расход токенов на обновление словаря фактов за сессию. */
+    var factsTokensSpent: Int = 0
+        private set
+
     /** Запускает агента с историей диалога и сохраняет обмен в историю. */
     suspend fun run(
         userQuery: String,
@@ -94,12 +125,36 @@ class LlmAgent(
         history += MessageObj("user", userQuery)
         history += MessageObj("assistant", result.answer)
 
-        // После обновления истории — проверяем, не пора ли обновить summary.
-        val (summaryTokens, snapshot) = maybeCompress()
+        // Пост-обработка зависит от стратегии: либо обновляем summary, либо словарь фактов.
+        var summaryTokens = 0
+        var summarySnap: String? = summary
+        var factsTokens = 0
+        var factsSnap: String? = facts
+
+        when (strategy) {
+            ContextStrategy.SUMMARY -> {
+                val (tok, snap) = maybeCompress()
+                summaryTokens = tok
+                summarySnap = snap
+            }
+
+            ContextStrategy.STICKY_FACTS -> {
+                val r = factsExtractor.update(facts, userQuery, result.answer)
+                facts = r.facts
+                factsTokensSpent += r.tokensSpent
+                factsTokens = r.tokensSpent
+                factsSnap = r.facts
+            }
+
+            ContextStrategy.SLIDING_WINDOW, ContextStrategy.BRANCHING -> Unit
+        }
+
         return result.copy(
             summaryTokens = summaryTokens,
-            summarySnapshot = snapshot,
+            summarySnapshot = summarySnap,
             historyFolded = foldedCount > 0,
+            factsTokens = factsTokens,
+            factsSnapshot = factsSnap,
         )
     }
 
@@ -110,12 +165,14 @@ class LlmAgent(
         attachments: List<String> = emptyList(),
     ): AgentResult = runInternal(userQuery, maxTokens, historyOverride = emptyList(), attachments)
 
-    /** Очищает историю диалога и сводку. */
+    /** Очищает историю диалога и весь долговременный контекст (summary, facts). */
     fun reset() {
         history.clear()
         summary = null
         summaryTokensSpent = 0
         foldedCount = 0
+        facts = null
+        factsTokensSpent = 0
     }
 
     /** Восстанавливает последние [pairs] обменов «user/assistant» для поддержки контекста. */
@@ -126,6 +183,31 @@ class LlmAgent(
             history += MessageObj("assistant", assistant)
         }
     }
+
+    /**
+     * Полное восстановление состояния агента (используется для переключения веток
+     * в стратегии BRANCHING).
+     */
+    fun restoreState(
+        rawHistory: List<MessageObj>,
+        summary: String?,
+        facts: String?,
+        foldedCount: Int,
+    ) {
+        history.clear()
+        history.addAll(rawHistory)
+        this.summary = summary
+        this.facts = facts
+        this.foldedCount = foldedCount.coerceIn(0, rawHistory.size)
+    }
+
+    /** Снимок внутреннего состояния агента (для сохранения веток). */
+    fun snapshotState(): AgentStateSnapshot = AgentStateSnapshot(
+        history = history.toList(),
+        summary = summary,
+        facts = facts,
+        foldedCount = foldedCount,
+    )
 
     /**
      * Если компрессия включена и в «сырой» части истории накопилось больше
@@ -224,22 +306,34 @@ class LlmAgent(
             append(config.systemPrompt)
             append("\n\n")
             append("Перед тем как дать ответ, подробно изложи свои рассуждения: что ты знаешь о проблеме, какие есть варианты, что важно учесть. Пиши только процесс мышления — без финального ответа.")
-            if (compressionConfig.enabled && !summary.isNullOrBlank() && historyOverride == null) {
-                append("\n\n")
-                append("Сводка предыдущего диалога (используй её как контекст):\n")
-                append(summary)
+            if (historyOverride == null) {
+                when (strategy) {
+                    ContextStrategy.SUMMARY -> if (!summary.isNullOrBlank()) {
+                        append("\n\n")
+                        append("Сводка предыдущего диалога (используй её как контекст):\n")
+                        append(summary)
+                    }
+
+                    ContextStrategy.STICKY_FACTS -> if (!facts.isNullOrBlank()) {
+                        append("\n\n")
+                        append("Ключевые факты из диалога (всегда учитывай):\n")
+                        append(facts)
+                    }
+
+                    ContextStrategy.SLIDING_WINDOW, ContextStrategy.BRANCHING -> Unit
+                }
             }
         }
         val system = MessageObj(role = "system", content = systemContent)
 
-        val recentHistory = if (historyOverride != null) {
-            historyOverride.takeLast(contextHistorySize)
-        } else if (compressionConfig.enabled) {
-            // «Сырая» часть истории (всё, что ещё не сжато) — максимум keepLastN.
-            val raw = history.subList(foldedCount, history.size)
-            raw.takeLast(minOf(contextHistorySize, compressionConfig.keepLastN))
-        } else {
-            history.takeLast(contextHistorySize)
+        val recentHistory: List<MessageObj> = when {
+            historyOverride != null -> historyOverride.takeLast(contextHistorySize)
+            strategy == ContextStrategy.SUMMARY -> {
+                val raw = history.subList(foldedCount, history.size)
+                raw.takeLast(minOf(contextHistorySize, compressionConfig.keepLastN))
+            }
+
+            else -> history.takeLast(contextHistorySize)
         }
 
         val userMsg = MessageObj(
@@ -262,3 +356,11 @@ class LlmAgent(
         return listOf(system, context)
     }
 }
+
+/** Снимок состояния агента — используется для веток диалога (BRANCHING). */
+data class AgentStateSnapshot(
+    val history: List<MessageObj>,
+    val summary: String?,
+    val facts: String?,
+    val foldedCount: Int,
+)
