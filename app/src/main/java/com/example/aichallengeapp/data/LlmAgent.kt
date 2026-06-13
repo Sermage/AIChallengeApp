@@ -33,6 +33,23 @@ data class AgentResult(
     val completionTokens: Int,
     /** true, если ответ обрублен по лимиту max_tokens (finish_reason = "length"). */
     val finishedByLength: Boolean = false,
+    /** Накладные расходы на обновление summary в этом запросе (0, если не было перегенерации). */
+    val summaryTokens: Int = 0,
+    /** Актуальный summary после этого вызова (если компрессия включена). */
+    val summarySnapshot: String? = null,
+    /**
+     * prompt_tokens только THINK-шага — это единственный вызов, в который попадает
+     * история диалога и summary, поэтому именно его имеет смысл сравнивать с оценкой
+     * «без сжатия».
+     */
+    val thinkPromptTokens: Int = 0,
+    /**
+     * Грубая оценка prompt_tokens THINK-шага, если бы вся история передавалась без сжатия.
+     * Используется для расчёта «сэкономлено за счёт компрессии».
+     */
+    val estimatedFullPromptTokens: Int = 0,
+    /** true, если к моменту этого вызова часть истории уже была свёрнута в summary. */
+    val historyFolded: Boolean = false,
 )
 
 /**
@@ -40,14 +57,32 @@ data class AgentResult(
  *   Шаг 1 (THINK) — строит внутреннее рассуждение.
  *   Шаг 2 (ANSWER) — формулирует финальный ответ на основе рассуждения.
  *
- * История диалога сохраняется между вызовами [run] для поддержки контекста.
+ * Поддерживает сжатие истории: старые сообщения заменяются краткой сводкой,
+ * пересоздаваемой каждые `compressionConfig.summarizeEvery` сообщений.
  */
-class LlmAgent(val config: AgentConfig) {
+class LlmAgent(
+    val config: AgentConfig,
+    private val compressor: HistoryCompressor = HistoryCompressor(),
+) {
 
-    /** Количество последних сообщений истории, передаваемых в контекст. */
+    /** Количество последних сообщений истории, передаваемых в контекст «как есть». */
     var contextHistorySize: Int = 4
 
+    /** Параметры сжатия истории. Если enabled=false — агент работает по старой логике. */
+    var compressionConfig: CompressionConfig = CompressionConfig(enabled = false)
+
     private val history = mutableListOf<MessageObj>()
+
+    /** Текущая сводка диалога (null, пока не было ни одной компрессии). */
+    var summary: String? = null
+        private set
+
+    /** Суммарный расход токенов на генерацию summary за всю сессию. */
+    var summaryTokensSpent: Int = 0
+        private set
+
+    /** Сколько сообщений из начала истории уже учтено в summary. */
+    private var foldedCount: Int = 0
 
     /** Запускает агента с историей диалога и сохраняет обмен в историю. */
     suspend fun run(
@@ -58,7 +93,14 @@ class LlmAgent(val config: AgentConfig) {
         val result = runInternal(userQuery, maxTokens, historyOverride = null, attachments)
         history += MessageObj("user", userQuery)
         history += MessageObj("assistant", result.answer)
-        return result
+
+        // После обновления истории — проверяем, не пора ли обновить summary.
+        val (summaryTokens, snapshot) = maybeCompress()
+        return result.copy(
+            summaryTokens = summaryTokens,
+            summarySnapshot = snapshot,
+            historyFolded = foldedCount > 0,
+        )
     }
 
     /** Запускает агента без истории диалога — только текущий запрос. */
@@ -68,18 +110,55 @@ class LlmAgent(val config: AgentConfig) {
         attachments: List<String> = emptyList(),
     ): AgentResult = runInternal(userQuery, maxTokens, historyOverride = emptyList(), attachments)
 
-    /** Очищает историю диалога. */
+    /** Очищает историю диалога и сводку. */
     fun reset() {
         history.clear()
+        summary = null
+        summaryTokensSpent = 0
+        foldedCount = 0
     }
 
     /** Восстанавливает последние [pairs] обменов «user/assistant» для поддержки контекста. */
     fun restoreHistory(pairs: List<Pair<String, String>>) {
-        history.clear()
+        reset()
         pairs.takeLast(2).forEach { (user, assistant) ->
             history += MessageObj("user", user)
             history += MessageObj("assistant", assistant)
         }
+    }
+
+    /**
+     * Если компрессия включена и в «сырой» части истории накопилось больше
+     * [CompressionConfig.keepLastN] + [CompressionConfig.summarizeEvery] сообщений,
+     * сжимает лишние в summary.
+     */
+    private suspend fun maybeCompress(): Pair<Int, String?> {
+        val cfg = compressionConfig
+        if (!cfg.enabled) return 0 to null
+
+        val rawSize = history.size - foldedCount
+        val excess = rawSize - cfg.keepLastN
+        if (excess < cfg.summarizeEvery) return 0 to summary
+
+        // Берём `excess` сообщений из начала «сырой» части и сворачиваем их в summary.
+        val newCutoff = foldedCount + excess
+        val batch = history.subList(foldedCount, newCutoff).toList()
+        val result = compressor.summarize(summary, batch)
+        summary = result.summary
+        summaryTokensSpent += result.tokensSpent
+        foldedCount = newCutoff
+        return result.tokensSpent to summary
+    }
+
+    /**
+     * Грубая оценка prompt_tokens, если бы вся история передавалась без сжатия.
+     * Считаем по символам ≈ 4 символа на токен (типичный коэффициент для русского/латиницы).
+     */
+    private fun estimateFullPromptTokens(query: String): Int {
+        val chars = config.systemPrompt.length +
+                history.sumOf { it.content.length } +
+                query.length
+        return chars / 4
     }
 
     private suspend fun runInternal(
@@ -91,6 +170,7 @@ class LlmAgent(val config: AgentConfig) {
         val startMs = System.currentTimeMillis()
         val steps = mutableListOf<AgentStep>()
         var totalTokens = 0
+        val estimatedFull = estimateFullPromptTokens(userQuery)
 
         // — Шаг 1: Думаем —
         val thinkResponse = GigaChatClient.chat(
@@ -117,7 +197,6 @@ class LlmAgent(val config: AgentConfig) {
         totalTokens += answerTokens
         steps += AgentStep(StepType.ANSWER, answer, answerTokens)
 
-        // Суммируем по обоим шагам — requestTokens + completionTokens == totalTokens
         val requestTokens = (thinkResponse.usage?.promptTokens ?: 0) +
                 (answerResponse.usage?.promptTokens ?: 0)
         val completionTokens = (thinkResponse.usage?.completionTokens ?: 0) +
@@ -131,6 +210,8 @@ class LlmAgent(val config: AgentConfig) {
             requestTokens = requestTokens,
             completionTokens = completionTokens,
             finishedByLength = answerChoice?.finishReason == "length",
+            thinkPromptTokens = thinkResponse.usage?.promptTokens ?: 0,
+            estimatedFullPromptTokens = estimatedFull,
         )
     }
 
@@ -139,13 +220,28 @@ class LlmAgent(val config: AgentConfig) {
         historyOverride: List<MessageObj>?,
         attachments: List<String>,
     ): List<MessageObj> {
-        val system = MessageObj(
-            role = "system",
-            content = """${config.systemPrompt}
+        val systemContent = buildString {
+            append(config.systemPrompt)
+            append("\n\n")
+            append("Перед тем как дать ответ, подробно изложи свои рассуждения: что ты знаешь о проблеме, какие есть варианты, что важно учесть. Пиши только процесс мышления — без финального ответа.")
+            if (compressionConfig.enabled && !summary.isNullOrBlank() && historyOverride == null) {
+                append("\n\n")
+                append("Сводка предыдущего диалога (используй её как контекст):\n")
+                append(summary)
+            }
+        }
+        val system = MessageObj(role = "system", content = systemContent)
 
-Перед тем как дать ответ, подробно изложи свои рассуждения: что ты знаешь о проблеме, какие есть варианты, что важно учесть. Пиши только процесс мышления — без финального ответа.""".trimIndent(),
-        )
-        val recentHistory = (historyOverride ?: history).takeLast(contextHistorySize)
+        val recentHistory = if (historyOverride != null) {
+            historyOverride.takeLast(contextHistorySize)
+        } else if (compressionConfig.enabled) {
+            // «Сырая» часть истории (всё, что ещё не сжато) — максимум keepLastN.
+            val raw = history.subList(foldedCount, history.size)
+            raw.takeLast(minOf(contextHistorySize, compressionConfig.keepLastN))
+        } else {
+            history.takeLast(contextHistorySize)
+        }
+
         val userMsg = MessageObj(
             role = "user",
             content = query,

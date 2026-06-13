@@ -1,10 +1,13 @@
 package com.example.aichallengeapp.ui.agent
 
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,6 +55,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -75,6 +81,10 @@ fun AgentScreen(
     val maxContextTokens by viewModel.maxContextTokens.collectAsState()
     val pendingAttachments by viewModel.pendingAttachments.collectAsState()
     val isUploading by viewModel.isUploading.collectAsState()
+    val compressionEnabled by viewModel.compressionEnabled.collectAsState()
+    val summarizeEvery by viewModel.summarizeEvery.collectAsState()
+    val currentSummary by viewModel.currentSummary.collectAsState()
+    val summaryTokensTotal by viewModel.summaryTokensTotal.collectAsState()
     var inputText by remember { mutableStateOf("") }
     var showHistory by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
@@ -147,6 +157,22 @@ fun AgentScreen(
             maxContextTokens = maxContextTokens,
             onChanged = { viewModel.setMaxContextTokens(it) },
         )
+
+        // Сжатие истории (тумблер + параметры)
+        CompressionSelector(
+            enabled = compressionEnabled,
+            summarizeEvery = summarizeEvery,
+            onEnabledChanged = { viewModel.setCompressionEnabled(it) },
+            onSummarizeEveryChanged = { viewModel.setSummarizeEvery(it) },
+        )
+
+        // Карточка с актуальным summary
+        if (compressionEnabled && !currentSummary.isNullOrBlank()) {
+            SummaryCard(
+                summary = currentSummary.orEmpty(),
+                summaryTokensTotal = summaryTokensTotal,
+            )
+        }
 
         HorizontalDivider()
 
@@ -640,13 +666,19 @@ private fun AttachmentChips(
 
 // ── Пузырь сообщения ───────────────────────────────────────────────────────────
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
     message: ChatMessage,
     isInContext: Boolean,
     contextLimit: Int,
 ) {
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    val copyText: (String) -> Unit = { text ->
+        clipboard.setText(AnnotatedString(text))
+        Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -675,21 +707,27 @@ private fun MessageBubble(
             }
         }
 
+        val bubbleShape = RoundedCornerShape(
+            topStart = 16.dp,
+            topEnd = 16.dp,
+            bottomStart = if (message.isUser) 16.dp else 4.dp,
+            bottomEnd = if (message.isUser) 4.dp else 16.dp,
+        )
         Box(
             modifier = Modifier
                 .widthIn(max = 300.dp)
+                .clip(bubbleShape)
                 .background(
                     color = when {
                         message.isContextOverflow -> MaterialTheme.colorScheme.errorContainer
                         message.isUser -> MaterialTheme.colorScheme.primaryContainer
                         else -> MaterialTheme.colorScheme.surfaceVariant
                     },
-                    shape = RoundedCornerShape(
-                        topStart = 16.dp,
-                        topEnd = 16.dp,
-                        bottomStart = if (message.isUser) 16.dp else 4.dp,
-                        bottomEnd = if (message.isUser) 4.dp else 16.dp,
-                    ),
+                    shape = bubbleShape,
+                )
+                .combinedClickable(
+                    onClick = {},
+                    onLongClick = { copyText(message.text) },
                 )
                 .padding(12.dp),
         ) {
@@ -704,19 +742,21 @@ private fun MessageBubble(
             ThinkingCard(step = thinkStep)
         }
 
-        // Ответ без контекста для сравнения
-        if (!message.isUser && message.noContextAnswer != null) {
-            NoContextCard(
-                answer = message.noContextAnswer,
-                tokens = message.noContextTokens,
-            )
-        }
-
         if (!message.isUser && message.totalTokens > 0) {
             Column(
                 modifier = Modifier.padding(top = 2.dp, start = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(1.dp),
             ) {
+                TextButton(
+                    onClick = { copyText(message.text) },
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier.height(24.dp),
+                ) {
+                    Text(
+                        text = "📋 Копировать",
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
                 Text(
                     text = "Запрос: ${message.requestTokens} tok  |  Ответ: ${message.completionTokens} tok",
                     style = MaterialTheme.typography.labelSmall,
@@ -732,6 +772,13 @@ private fun MessageBubble(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (message.compressionUsed && message.historyFolded) {
+                    CompressionSavingsRow(
+                        actualPromptTokens = message.thinkPromptTokens,
+                        estimatedFullPromptTokens = message.estimatedFullPromptTokens,
+                        summaryTokens = message.compressedSummaryTokens,
+                    )
+                }
                 MiniContextBar(
                     historyTokens = message.historyTokens,
                     contextLimit = contextLimit,
@@ -780,41 +827,44 @@ private fun ThinkingCard(step: AgentStep) {
     }
 }
 
+// ── Строка «сэкономлено за счёт сжатия» под ответом ───────────────────────────
+
 @Composable
-private fun NoContextCard(answer: String, tokens: Int) {
-    var expanded by remember { mutableStateOf(false) }
-    Card(
-        modifier = Modifier
-            .widthIn(max = 300.dp)
-            .padding(top = 4.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.secondaryContainer,
-        ),
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
-            TextButton(
-                onClick = { expanded = !expanded },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    text = if (expanded) "Без контекста ▲" else "Без контекста ▼",
-                    style = MaterialTheme.typography.labelSmall,
+private fun CompressionSavingsRow(
+    actualPromptTokens: Int,
+    estimatedFullPromptTokens: Int,
+    summaryTokens: Int,
+) {
+    val saved = estimatedFullPromptTokens - actualPromptTokens
+    val percent = if (estimatedFullPromptTokens > 0)
+        (saved * 100 / estimatedFullPromptTokens)
+    else 0
+    val color = when {
+        saved > 0 -> MaterialTheme.colorScheme.primary
+        saved == 0 -> MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.error
+    }
+    Column {
+        Text(
+            text = "Сжатие: prompt $actualPromptTokens tok • без сжатия ≈ $estimatedFullPromptTokens tok",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = "Экономия: ${if (saved >= 0) "−" else "+"}${kotlin.math.abs(saved)} tok (${if (saved >= 0) "−" else "+"}${
+                kotlin.math.abs(
+                    percent
                 )
-            }
-            AnimatedVisibility(visible = expanded) {
-                Column(modifier = Modifier.padding(bottom = 6.dp)) {
-                    Text(
-                        text = answer,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = "$tokens tok",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                    )
-                }
-            }
+            }%)",
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+        )
+        if (summaryTokens > 0) {
+            Text(
+                text = "Сводка пересчитана: +$summaryTokens tok (накладные)",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.tertiary,
+            )
         }
     }
 }
@@ -916,3 +966,116 @@ private fun ThinkingIndicator(agentName: String) {
         )
     }
 }
+
+// ── Сжатие истории: настройки ─────────────────────────────────────────────────
+
+@Composable
+private fun CompressionSelector(
+    enabled: Boolean,
+    summarizeEvery: Int,
+    onEnabledChanged: (Boolean) -> Unit,
+    onSummarizeEveryChanged: (Int) -> Unit,
+) {
+    val options = listOf(5, 10, 20)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "сжатие:",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(end = 2.dp),
+        )
+        if (enabled) {
+            Button(
+                onClick = { onEnabledChanged(false) },
+                modifier = Modifier.height(32.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+            ) {
+                Text("вкл", style = MaterialTheme.typography.labelMedium)
+            }
+        } else {
+            OutlinedButton(
+                onClick = { onEnabledChanged(true) },
+                modifier = Modifier.height(32.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+            ) {
+                Text("выкл", style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        Spacer(Modifier.width(4.dp))
+        Text(
+            text = "каждые",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        options.forEach { value ->
+            val selected = summarizeEvery == value
+            if (selected) {
+                Button(
+                    onClick = { onSummarizeEveryChanged(value) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    enabled = enabled,
+                ) {
+                    Text("$value", style = MaterialTheme.typography.labelMedium)
+                }
+            } else {
+                OutlinedButton(
+                    onClick = { onSummarizeEveryChanged(value) },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    enabled = enabled,
+                ) {
+                    Text("$value", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+    }
+}
+
+// ── Карточка текущей сводки ───────────────────────────────────────────────────
+
+@Composable
+private fun SummaryCard(summary: String, summaryTokensTotal: Int) {
+    var expanded by remember { mutableStateOf(false) }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+            TextButton(
+                onClick = { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = if (expanded) "Сводка диалога ▲" else "Сводка диалога (накладные: $summaryTokensTotal tok) ▼",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(modifier = Modifier.padding(bottom = 6.dp)) {
+                    Text(
+                        text = summary,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Потрачено на summary: $summaryTokensTotal tok",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                }
+            }
+        }
+    }
+}
+
